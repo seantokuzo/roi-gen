@@ -2,18 +2,19 @@
 
 > Living document. Updated at every phase transition and merged PR.
 
-## Current Phase: 0 — Scaffold (in progress)
+## Current Phase: 1 — Domain + broker spine (in progress)
 
 | Date | Event |
 |---|---|
 | 2026-06-10 | Discovery complete: 10-agent legacy audit + 2026 landscape research → `docs/RESEARCH.md` |
 | 2026-06-10 | v3 architecture + game plan written → `ROI-GEN-GAME-PLAN.md` |
-| 2026-06-10 | Phase 0 scaffold started |
+| 2026-06-10 | Phase 0 scaffold complete: full compose stack verified healthy locally (engine heartbeat on Redis observed), CI green on main |
+| 2026-06-10 | Phase 1 started (PR 1a: domain models + auth + portfolios) |
 
 ## Phase Tracker
 
-- [ ] **Phase 0 — Scaffold**: repo, compose stack, CI, review workflow, docs ← *we are here*
-- [ ] **Phase 1 — Domain + broker spine**: models/Alembic, auth, BrokerAdapter, market-data spine, trade-updates, reconciliation
+- [x] **Phase 0 — Scaffold**: repo, compose stack, CI, review workflow, docs ✅ 2026-06-10
+- [ ] **Phase 1 — Domain + broker spine**: models/Alembic, auth, BrokerAdapter, market-data spine, trade-updates, reconciliation ← *we are here*
 - [ ] **Phase 2 — Engine + risk core**: event bus, Strategy base, Risk Engine, order state machine, FIFO P&L, kill switch
 - [ ] **Phase 3 — Simulator + backtest parity**
 - [ ] **Phase 4 — Strategy roster v1**: noise-area momentum, VWAP trend, regime classifier v1
