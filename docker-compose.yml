@@ -1,0 +1,138 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# ROI-GEN — local dev topology
+#
+#   db (pgvector/pg17, :5432) ──┐
+#                               ├──> api    (FastAPI, backend image, :8000)
+#   redis (7-alpine, :6379) ────┤
+#                               └──> engine (asyncio trading engine, SAME
+#                                            backend image, no ports — talks
+#                                            to api/UI via Redis pub/sub)
+#
+#   frontend (nginx serving the Vite build, host :4300 -> container :80)
+#       └──> proxies/fetches the api at :8000
+#
+# api and engine share one image (backend/Dockerfile); only the command
+# differs. Both read .env (optional pre-setup) but DATABASE_URL/REDIS_URL are
+# overridden here to point at the compose service hostnames instead of
+# localhost. Single network: roigen.
+#
+# Quickstart:  ./scripts/dev.sh          # db + redis only (run api/engine on host)
+#              docker compose up -d      # full stack
+# ──────────────────────────────────────────────────────────────────────────────
+
+name: roigen
+
+services:
+  db:
+    image: pgvector/pgvector:pg17
+    container_name: roigen-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: roigen
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d roigen"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    networks:
+      - roigen
+
+  redis:
+    image: redis:7-alpine
+    container_name: roigen-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    networks:
+      - roigen
+
+  api:
+    build: ./backend
+    container_name: roigen-api
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file:
+      - path: .env
+        required: false # compose must work before .env exists
+    environment:
+      # override localhost defaults from .env with service hostnames
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@db:5432/roigen
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      # python stdlib probe — the slim runtime image ships no curl/wget
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health', timeout=4).status == 200 else 1)",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks:
+      - roigen
+
+  engine:
+    build: ./backend # same image as api; only the command differs
+    container_name: roigen-engine
+    restart: unless-stopped
+    command: python -m app.engine_main
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@db:5432/roigen
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    # No healthcheck: the engine exposes no HTTP surface. Liveness is observed
+    # via logs and its Redis heartbeat; restart: unless-stopped covers crashes.
+    networks:
+      - roigen
+
+  frontend:
+    build: ./frontend
+    container_name: roigen-frontend
+    restart: unless-stopped
+    ports:
+      - "4300:80"
+    depends_on:
+      - api
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:80/"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - roigen
+
+volumes:
+  pgdata:
+
+networks:
+  roigen:

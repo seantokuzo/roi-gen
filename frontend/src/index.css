@@ -1,0 +1,62 @@
+@import "tailwindcss";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme {
+  --font-sans: "Inter", system-ui, -apple-system, sans-serif;
+  --font-mono: ui-monospace, "Cascadia Code", "Fira Code", Consolas, monospace;
+
+  --color-background: #0a0a0a;
+  --color-foreground: #ffffff;
+  --color-card: #1a1a1a;
+  --color-card-foreground: #ffffff;
+  --color-popover: #1a1a1a;
+  --color-popover-foreground: #ffffff;
+  --color-primary: #1976d2;
+  --color-primary-foreground: #ffffff;
+  --color-secondary: #141414;
+  --color-secondary-foreground: #ffffff;
+  --color-muted: #1a1a1a;
+  --color-muted-foreground: #b0b0b0;
+  --color-accent: #1a1a1a;
+  --color-accent-foreground: #ffffff;
+  --color-destructive: #f44336;
+  --color-destructive-foreground: #ffffff;
+  --color-success: #4caf50;
+  --color-warning: #ff9800;
+  --color-border: #2e2e2e;
+  --color-input: #2e2e2e;
+  --color-ring: #1976d2;
+  --color-sidebar: #141414;
+  --color-sidebar-foreground: #b0b0b0;
+
+  --radius-sm: 0.25rem;
+  --radius-md: 0.375rem;
+  --radius-lg: 0.5rem;
+  --radius-xl: 0.75rem;
+}
+
+body {
+  margin: 0;
+  font-family: var(--font-sans);
+  background-color: var(--color-background);
+  color: var(--color-foreground);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: var(--color-background);
+}
+::-webkit-scrollbar-thumb {
+  background: var(--color-border);
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--color-muted-foreground);
+}

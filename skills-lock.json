@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "skills": {
+    "shadcn-ui": {
+      "source": "jezweb/claude-skills",
+      "sourceType": "github",
+      "computedHash": "c9871cb4685898b3d5ac3dd54924a6818ca4817de5ca40d546eba06d0ada53a8"
+    },
+    "tailwind-theme-builder": {
+      "source": "jezweb/claude-skills",
+      "sourceType": "github",
+      "computedHash": "fd84027a0d97134a73054d010f3ebc0352de7d6f24567086444aa7884c24bcde"
+    },
+    "vercel-react-best-practices": {
+      "source": "vercel-labs/agent-skills",
+      "sourceType": "github",
+      "computedHash": "afeca00ac2f492d88fdd010e73d91719a5b57c564bb4a73325b0bd77e11323ab"
+    },
+    "web-design-guidelines": {
+      "source": "vercel-labs/agent-skills",
+      "sourceType": "github",
+      "computedHash": "a6a44d5498f7e8f68289902f3dedfc6f38ae0cee1e96527c80724cf27f727c2a"
+    }
+  }
+}

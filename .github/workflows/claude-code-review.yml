@@ -1,0 +1,96 @@
+name: Claude Code Review
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+concurrency:
+  group: claude-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+  id-token: write
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Run Claude review
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          track_progress: true
+          prompt: |
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ github.event.pull_request.number }}
+            HEAD SHA: ${{ github.event.pull_request.head.sha }}
+
+            You are the automated reviewer for ROI-GEN, a single-user autonomous
+            trading platform. Real money is on the line — review for
+            correctness, security, and risk. The PR branch is already checked
+            out in the working directory. Read CLAUDE.md at the repo root
+            before judging anything.
+
+            ## Iron laws (violations are BLOCKING findings)
+
+            Apply special scrutiny to the iron laws in CLAUDE.md, in particular:
+            - Every order passes through the Risk Engine: no code path may call
+              broker order methods except the execution handler, and no
+              execution without a risk-engine approval token.
+            - No LLM calls in the engine's hot path (deterministic fast loop;
+              LLM output enters via the intelligence layer only).
+            - No PDT logic anywhere (FINRA retired the rule 2026-06-04; the
+              legacy fields are gone from Alpaca's API).
+            - Entries carry protection: bracket orders in RTH, self-managed
+              limit exits in extended hours. A position without a stop is a bug.
+            - Money is Decimal/Numeric — never float.
+            - Timezone-aware datetimes only (UTC in code, ET for market logic);
+              never naive datetimes.
+            - Every schema change ships an Alembic migration — no create_all.
+
+            ## Deep-dive escalation
+
+            If the diff touches any of:
+            - backend/app/engine/risk*
+            - backend/app/engine/execution*
+            - backend/app/services/broker*
+            - .github/workflows/**
+            then do NOT review the diff in isolation: read the surrounding
+            modules and trace the order/data flow end to end (signal -> risk ->
+            execution -> broker) before reaching a verdict. These are the
+            money-losing surfaces.
+
+            ## How to report
+
+            1. Inspect the full diff with `gh pr diff` and read every touched
+               file at the referenced lines.
+            2. Post line-specific findings as inline comments using
+               mcp__github_inline_comment__create_inline_comment (with
+               confirmed: true). Prefix each finding with BLOCKING: or
+               ADVISORY:.
+            3. STICKY VERDICT (mandatory, exactly one comment): list existing
+               PR comments with
+               `gh api "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments?per_page=100"`
+               and look for one whose body contains the literal marker
+               `<!-- ROIGEN-VERDICT-STICKY -->`.
+               - If it exists, UPDATE it in place:
+                 `gh api -X PATCH "repos/${{ github.repository }}/issues/comments/<comment_id>" -f body=...`
+               - Otherwise create it with `gh pr comment`.
+               The sticky body MUST contain, in this order:
+               - the literal marker `<!-- ROIGEN-VERDICT-STICKY -->`
+               - `Verdict: approve` or `Verdict: request-changes`
+               - `Blocking: <count> | Advisory: <count>`
+               - `Head SHA reviewed: ${{ github.event.pull_request.head.sha }}`
+               - a short summary of the round (what was checked, key findings).
+            4. Verdict rule: any BLOCKING finding => request-changes;
+               otherwise approve. Only post GitHub comments — do not submit
+               review text as plain messages.
+          claude_args: |
+            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh api:*)"

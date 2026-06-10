@@ -1,0 +1,58 @@
+# Environment & secrets
+.env
+.env.*
+*.pem
+*.key
+
+# Git
+.git/
+.gitignore
+
+# Dependencies (rebuilt inside the container)
+node_modules/
+.pnpm-store/
+
+# Build outputs
+dist/
+build/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+.coverage
+htmlcov/
+
+# Local data / backups (never bake into images)
+data/
+backups/
+
+# IDE & editors
+.idea/
+.vscode/
+*.swp
+*~
+
+# Testing
+coverage/
+.nyc_output/
+
+# Docs & non-essential
+*.md
+!README.md
+docs/
+.agents/
+.claude/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/

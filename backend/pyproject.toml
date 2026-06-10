@@ -1,0 +1,40 @@
+[project]
+name = "roi-gen-backend"
+version = "0.1.0"
+description = "ROI-GEN backend — FastAPI API + asyncio trading engine"
+requires-python = ">=3.12"
+dependencies = [
+    "alembic>=1.18.4",
+    "asyncpg>=0.31.0",
+    "fastapi>=0.136.3",
+    "httpx>=0.28.1",
+    "pydantic-settings>=2.14.1",
+    "redis>=8.0.0",
+    "sqlalchemy[asyncio]>=2.0.50",
+    "structlog>=26.1.0",
+    "uvicorn[standard]>=0.49.0",
+]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.mypy]
+strict = true
+python_version = "3.12"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[dependency-groups]
+dev = [
+    "anyio>=4.13.0",
+    "mypy>=2.1.0",
+    "pytest>=9.0.3",
+    "pytest-asyncio>=1.4.0",
+    "ruff>=0.15.16",
+]
