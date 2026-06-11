@@ -19,10 +19,15 @@ if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
 # DATABASE_URL comes from settings (.env via pydantic-settings) — never from alembic.ini.
-config.set_main_option("sqlalchemy.url", get_settings().database_url)
+# A programmatic Config may pre-set sqlalchemy.url (tests point it at the *_test db);
+# only fall back to settings when no URL was provided.
+if not config.get_main_option("sqlalchemy.url"):
+    config.set_main_option("sqlalchemy.url", get_settings().database_url)
 
-# Model metadata for autogenerate. Import model modules here as they land
-# so their tables register on Base.metadata.
+# Model metadata for autogenerate: importing app.models registers every
+# table on Base.metadata.
+import app.models  # noqa: E402,F401
+
 target_metadata = Base.metadata
 
 
