@@ -1,11 +1,20 @@
 """Settings parsing sanity checks against the .env.example contract."""
 
+import os
 from decimal import Decimal
 
 import pytest
 from pydantic import ValidationError
 
 from app.core.config import Settings, get_settings
+
+
+@pytest.fixture(autouse=True)
+def _clean_settings_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Default-asserting tests must not see ambient env (CI exports DATABASE_URL)."""
+    for key in list(os.environ):
+        if key.lower() in Settings.model_fields:
+            monkeypatch.delenv(key, raising=False)
 
 
 def test_defaults_match_env_contract() -> None:
