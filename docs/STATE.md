@@ -10,6 +10,9 @@
 | 2026-06-10 | v3 architecture + game plan written → `ROI-GEN-GAME-PLAN.md` |
 | 2026-06-10 | Phase 0 scaffold complete: full compose stack verified healthy locally (engine heartbeat on Redis observed), CI green on main |
 | 2026-06-10 | Phase 1 started (PR 1a: domain models + auth + portfolios) |
+| 2026-06-10 | **PR #1 merged** (Phase 1a): 10-table schema + pgvector migration, fail-closed Google→JWT auth, portfolios + Fernet-encrypted credentials. 69 tests. Cloud review unavailable (ANTHROPIC_API_KEY secret not set) — substituted 7-angle local review; fix round added DB-enforced invariants (one-default-per-user partial unique, fill dedup, lot CHECKs, hot-path indexes) |
+
+**Phase 1 remaining (PR 1b — next up):** BrokerAdapter (async httpx REST + alpaca-py streams), market-data consumer (fan-out/reconnect/backfill/staleness watchdog), trade-updates consumer, account/position sync + boot reconciliation, account state API.
 
 ## Phase Tracker
 
