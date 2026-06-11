@@ -11,7 +11,16 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import DateTime, ForeignKey, Index, Numeric, String, UniqueConstraint
+from sqlalchemy import (
+    CheckConstraint,
+    DateTime,
+    ForeignKey,
+    Index,
+    Numeric,
+    String,
+    UniqueConstraint,
+    text,
+)
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -30,7 +39,11 @@ class Order(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     """
 
     __tablename__ = "orders"
-    __table_args__ = (Index("ix_orders_portfolio_id_created_at", "portfolio_id", "created_at"),)
+    __table_args__ = (
+        Index("ix_orders_portfolio_id_created_at", "portfolio_id", "created_at"),
+        # Hot path: "open orders for this portfolio" during reconciliation/engine loops.
+        Index("ix_orders_portfolio_status", "portfolio_id", "status"),
+    )
 
     client_order_id: Mapped[str] = mapped_column(String(128), unique=True)
     broker_order_id: Mapped[str | None] = mapped_column(String(128), unique=True)
@@ -61,6 +74,15 @@ class Fill(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     """A (partial) execution of an order, as reported by the broker stream."""
 
     __tablename__ = "fills"
+    __table_args__ = (
+        # Dedup guard: the broker stream can redeliver fill events.
+        Index(
+            "uq_fills_broker_fill_id",
+            "broker_fill_id",
+            unique=True,
+            postgresql_where=text("broker_fill_id IS NOT NULL"),
+        ),
+    )
 
     order_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("orders.id"), index=True)
     broker_fill_id: Mapped[str | None] = mapped_column(String(128))
@@ -93,6 +115,9 @@ class Lot(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __tablename__ = "lots"
     __table_args__ = (
         Index("ix_lots_portfolio_id_symbol_opened_at", "portfolio_id", "symbol", "opened_at"),
+        CheckConstraint("qty_orig > 0", name="ck_lots_qty_orig_positive"),
+        CheckConstraint("qty_open >= 0", name="ck_lots_qty_open_nonneg"),
+        CheckConstraint("qty_open <= qty_orig", name="ck_lots_qty_open_le_orig"),
     )
 
     portfolio_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("portfolios.id"))

@@ -17,7 +17,17 @@ from sqlalchemy.orm import selectinload
 from app.api.v1.deps import CurrentUser, DbSession
 from app.core.config import get_settings
 from app.core.logging import get_logger
-from app.models import BrokerCredential, Order, Portfolio, PortfolioMode, Strategy, User
+from app.models import (
+    BrokerCredential,
+    EquitySnapshot,
+    Lot,
+    Order,
+    Portfolio,
+    PortfolioMode,
+    Position,
+    Strategy,
+    User,
+)
 from app.schemas.portfolio import (
     CredentialsIn,
     PortfolioCreate,
@@ -45,6 +55,7 @@ def _to_out(portfolio: Portfolio, *, has_credentials: bool | None = None) -> Por
         is_default=portfolio.is_default,
         has_credentials=has_credentials,
         created_at=portfolio.created_at,
+        updated_at=portfolio.updated_at,
     )
 
 
@@ -177,7 +188,10 @@ async def update_portfolio(
     portfolio = await _get_owned_portfolio(db, user, portfolio_id)
     changes = payload.model_dump(exclude_unset=True)
     if changes.get("is_default") is True:
-        # Single UPDATE clears the flag on all siblings — no read-modify-write.
+        # Clear siblings FIRST (single UPDATE, same transaction) so setting the
+        # new default below never transiently violates the partial unique index
+        # uq_portfolios_one_default_per_user; the index closes the cross-request
+        # race the UPDATE alone can't.
         await db.execute(
             update(Portfolio)
             .where(Portfolio.user_id == user.id, Portfolio.id != portfolio.id)
@@ -189,27 +203,40 @@ async def update_portfolio(
         await db.commit()
     except IntegrityError as exc:
         await db.rollback()
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Update violates a constraint (duplicate name?)",
-        ) from exc
+        if "uq_portfolios_one_default_per_user" in str(exc):
+            detail = "Another portfolio became the default concurrently; retry"
+        else:
+            detail = "Update violates a constraint (duplicate name?)"
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=detail) from exc
+    # updated_at is set server-side (onupdate=func.now()) — re-fetch it so the
+    # response isn't stale. Scoped to the column so the eager-loaded
+    # broker_credential relationship isn't expired (no async lazy-load).
+    await db.refresh(portfolio, attribute_names=["updated_at"])
     return _to_out(portfolio)
 
 
 @router.delete("/{portfolio_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_portfolio(portfolio_id: uuid.UUID, user: CurrentUser, db: DbSession) -> None:
-    """Delete a portfolio. 409 if strategies/orders reference it; credentials cascade."""
+    """Delete a portfolio. 409 if domain rows reference it; credentials cascade."""
     portfolio = await _get_owned_portfolio(db, user, portfolio_id)
+    # Cover every FK-bearing table so a referenced portfolio 409s instead of
+    # 500ing on the FK violation at delete time.
     referenced = await db.scalar(
         select(
             exists().where(Strategy.portfolio_id == portfolio.id)
             | exists().where(Order.portfolio_id == portfolio.id)
+            | exists().where(Position.portfolio_id == portfolio.id)
+            | exists().where(Lot.portfolio_id == portfolio.id)
+            | exists().where(EquitySnapshot.portfolio_id == portfolio.id)
         )
     )
     if referenced:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="Portfolio has strategies or orders attached; remove them first",
+            detail=(
+                "Portfolio has strategies, orders, positions, lots, or equity "
+                "snapshots attached; remove them first"
+            ),
         )
     await db.delete(portfolio)
     await db.commit()
@@ -221,6 +248,15 @@ async def put_credentials(
 ) -> PortfolioOut:
     """Upsert the portfolio's broker credentials (encrypted at rest, never echoed)."""
     portfolio = await _get_owned_portfolio(db, user, portfolio_id)
+    if payload.paper != (portfolio.mode == PortfolioMode.paper):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=(
+                f"Credential/mode mismatch: this is a {portfolio.mode} portfolio. "
+                "Paper portfolios need paper keys (paper=true) and live "
+                "portfolios need live keys (paper=false)."
+            ),
+        )
     api_key_encrypted = encrypt_str(payload.api_key)
     api_secret_encrypted = encrypt_str(payload.api_secret)
     credential = portfolio.broker_credential

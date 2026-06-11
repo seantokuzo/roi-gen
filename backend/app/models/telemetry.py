@@ -41,6 +41,8 @@ class EventLog(Base):
     __table_args__ = (
         Index("ix_event_log_event_type_ts", "event_type", "ts"),
         Index("ix_event_log_ts", "ts"),
+        # Recovery replay: "events for this portfolio in time order".
+        Index("ix_event_log_portfolio_ts", "portfolio_id", "ts"),
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)

@@ -5,7 +5,7 @@ from __future__ import annotations
 import uuid
 from typing import TYPE_CHECKING
 
-from sqlalchemy import ForeignKey, String, Text, UniqueConstraint
+from sqlalchemy import ForeignKey, Index, String, Text, UniqueConstraint, text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
@@ -22,7 +22,17 @@ class Portfolio(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     """
 
     __tablename__ = "portfolios"
-    __table_args__ = (UniqueConstraint("user_id", "name", name="uq_portfolios_user_id_name"),)
+    __table_args__ = (
+        UniqueConstraint("user_id", "name", name="uq_portfolios_user_id_name"),
+        # DB-enforced "one default per user" — closes the race the PATCH
+        # endpoint's clear-siblings UPDATE can't (partial unique index).
+        Index(
+            "uq_portfolios_one_default_per_user",
+            "user_id",
+            unique=True,
+            postgresql_where=text("is_default"),
+        ),
+    )
 
     user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"))
     name: Mapped[str] = mapped_column(String(100))

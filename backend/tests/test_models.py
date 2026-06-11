@@ -297,6 +297,78 @@ async def test_portfolio_name_unique_per_user(db_session: AsyncSession, seeded_u
     await db_session.rollback()
 
 
+async def test_only_one_default_portfolio_per_user(
+    db_session: AsyncSession, seeded_user: User
+) -> None:
+    db_session.add(
+        Portfolio(user_id=seeded_user.id, name="alpha", mode=PortfolioMode.paper, is_default=True)
+    )
+    await db_session.commit()
+
+    db_session.add(
+        Portfolio(user_id=seeded_user.id, name="beta", mode=PortfolioMode.paper, is_default=True)
+    )
+    with pytest.raises(IntegrityError):
+        await db_session.flush()
+    await db_session.rollback()
+
+
+async def test_broker_fill_id_unique_when_present(
+    db_session: AsyncSession, seeded_user: User
+) -> None:
+    portfolio = await _make_portfolio(db_session, seeded_user)
+    order = _make_order(portfolio)
+    db_session.add(order)
+    await db_session.commit()
+    occurred = datetime(2026, 6, 10, 14, 30, 0, tzinfo=UTC)
+
+    def _fill(broker_fill_id: str | None) -> Fill:
+        return Fill(
+            order_id=order.id,
+            broker_fill_id=broker_fill_id,
+            qty=Decimal("1"),
+            price=Decimal("190.20"),
+            occurred_at=occurred,
+        )
+
+    # NULL broker_fill_ids are exempt from the partial unique index.
+    db_session.add_all([_fill(None), _fill(None), _fill("bf-dup")])
+    await db_session.commit()
+
+    db_session.add(_fill("bf-dup"))
+    with pytest.raises(IntegrityError):
+        await db_session.flush()
+    await db_session.rollback()
+
+
+@pytest.mark.parametrize(
+    ("qty_orig", "qty_open"),
+    [
+        (Decimal("0"), Decimal("0")),  # ck_lots_qty_orig_positive
+        (Decimal("5"), Decimal("-1")),  # ck_lots_qty_open_nonneg
+        (Decimal("5"), Decimal("6")),  # ck_lots_qty_open_le_orig
+    ],
+)
+async def test_lot_quantity_bounds_enforced(
+    db_session: AsyncSession, seeded_user: User, qty_orig: Decimal, qty_open: Decimal
+) -> None:
+    portfolio = await _make_portfolio(db_session, seeded_user)
+    db_session.add(
+        Lot(
+            portfolio_id=portfolio.id,
+            symbol="TSLA",
+            side=OrderSide.buy,
+            qty_orig=qty_orig,
+            qty_open=qty_open,
+            entry_price=Decimal("250.10"),
+            opened_at=datetime(2026, 6, 10, 14, 31, 0, tzinfo=UTC),
+        )
+    )
+    with pytest.raises(IntegrityError):
+        await db_session.flush()
+    await db_session.rollback()
+
+
 # ── Cascade ──────────────────────────────────────────────────────
 
 

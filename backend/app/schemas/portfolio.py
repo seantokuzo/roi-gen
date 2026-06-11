@@ -46,3 +46,4 @@ class PortfolioOut(BaseModel):
     is_default: bool
     has_credentials: bool
     created_at: datetime
+    updated_at: datetime

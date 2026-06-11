@@ -42,6 +42,7 @@ def upgrade() -> None:
     )
     op.create_index("ix_event_log_event_type_ts", "event_log", ["event_type", "ts"], unique=False)
     op.create_index("ix_event_log_ts", "event_log", ["ts"], unique=False)
+    op.create_index("ix_event_log_portfolio_ts", "event_log", ["portfolio_id", "ts"], unique=False)
     op.create_table(
         "users",
         sa.Column("email", sa.String(length=255), nullable=False),
@@ -88,6 +89,13 @@ def upgrade() -> None:
         ),
         sa.PrimaryKeyConstraint("id"),
         sa.UniqueConstraint("user_id", "name", name="uq_portfolios_user_id_name"),
+    )
+    op.create_index(
+        "uq_portfolios_one_default_per_user",
+        "portfolios",
+        ["user_id"],
+        unique=True,
+        postgresql_where=sa.text("is_default"),
     )
     op.create_table(
         "broker_credentials",
@@ -248,6 +256,9 @@ def upgrade() -> None:
     )
     op.create_index(op.f("ix_orders_status"), "orders", ["status"], unique=False)
     op.create_index(op.f("ix_orders_symbol"), "orders", ["symbol"], unique=False)
+    op.create_index(
+        "ix_orders_portfolio_status", "orders", ["portfolio_id", "status"], unique=False
+    )
     op.create_table(
         "fills",
         sa.Column("order_id", sa.Uuid(), nullable=False),
@@ -276,6 +287,13 @@ def upgrade() -> None:
         sa.PrimaryKeyConstraint("id"),
     )
     op.create_index(op.f("ix_fills_order_id"), "fills", ["order_id"], unique=False)
+    op.create_index(
+        "uq_fills_broker_fill_id",
+        "fills",
+        ["broker_fill_id"],
+        unique=True,
+        postgresql_where=sa.text("broker_fill_id IS NOT NULL"),
+    )
     op.create_table(
         "lots",
         sa.Column("portfolio_id", sa.Uuid(), nullable=False),
@@ -302,6 +320,9 @@ def upgrade() -> None:
             server_default=sa.text("now()"),
             nullable=False,
         ),
+        sa.CheckConstraint("qty_orig > 0", name="ck_lots_qty_orig_positive"),
+        sa.CheckConstraint("qty_open >= 0", name="ck_lots_qty_open_nonneg"),
+        sa.CheckConstraint("qty_open <= qty_orig", name="ck_lots_qty_open_le_orig"),
         sa.ForeignKeyConstraint(
             ["entry_fill_id"],
             ["fills.id"],
@@ -332,8 +353,10 @@ def downgrade() -> None:
     op.drop_index(op.f("ix_lots_symbol"), table_name="lots")
     op.drop_index("ix_lots_portfolio_id_symbol_opened_at", table_name="lots")
     op.drop_table("lots")
+    op.drop_index("uq_fills_broker_fill_id", table_name="fills")
     op.drop_index(op.f("ix_fills_order_id"), table_name="fills")
     op.drop_table("fills")
+    op.drop_index("ix_orders_portfolio_status", table_name="orders")
     op.drop_index(op.f("ix_orders_symbol"), table_name="orders")
     op.drop_index(op.f("ix_orders_status"), table_name="orders")
     op.drop_index("ix_orders_portfolio_id_created_at", table_name="orders")
@@ -343,9 +366,11 @@ def downgrade() -> None:
     op.drop_index("ix_equity_snapshots_portfolio_id_ts", table_name="equity_snapshots")
     op.drop_table("equity_snapshots")
     op.drop_table("broker_credentials")
+    op.drop_index("uq_portfolios_one_default_per_user", table_name="portfolios")
     op.drop_table("portfolios")
     op.drop_index(op.f("ix_users_email"), table_name="users")
     op.drop_table("users")
+    op.drop_index("ix_event_log_portfolio_ts", table_name="event_log")
     op.drop_index("ix_event_log_ts", table_name="event_log")
     op.drop_index("ix_event_log_event_type_ts", table_name="event_log")
     op.drop_table("event_log")

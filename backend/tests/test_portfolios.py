@@ -6,6 +6,8 @@ are independent of the auth module's implementation progress.
 
 import uuid
 from collections.abc import AsyncGenerator
+from datetime import datetime
+from decimal import Decimal
 from typing import Any
 
 import httpx
@@ -16,7 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.deps import require_user
 from app.core.config import get_settings
-from app.models import BrokerCredential, Portfolio, PortfolioMode, Strategy, User
+from app.models import BrokerCredential, Portfolio, PortfolioMode, Position, Strategy, User
 from app.services.crypto import decrypt_str
 
 API = "/api/v1/portfolios"
@@ -149,6 +151,21 @@ async def test_default_flag_is_exclusive(auth_client: httpx.AsyncClient) -> None
     assert by_name["beta"]["is_default"] is True
 
 
+async def test_patch_response_updated_at_is_fresh(auth_client: httpx.AsyncClient) -> None:
+    created = await _create(auth_client, name="alpha")
+    assert created["updated_at"] is not None
+    created_at = datetime.fromisoformat(created["created_at"])
+    original_updated = datetime.fromisoformat(created["updated_at"])
+
+    resp = await auth_client.patch(f"{API}/{created['id']}", json={"name": "renamed"})
+    assert resp.status_code == 200
+    patched_updated = datetime.fromisoformat(resp.json()["updated_at"])
+    # onupdate=func.now() runs server-side in a later transaction — the PATCH
+    # response must reflect the fresh value, not the stale loaded one.
+    assert patched_updated > original_updated
+    assert patched_updated >= created_at
+
+
 # ── Delete ───────────────────────────────────────────────────────
 
 
@@ -167,6 +184,26 @@ async def test_delete_with_strategy_conflicts(
     await db_session.commit()
     assert (await auth_client.delete(f"{API}/{portfolio_id}")).status_code == 204
     assert (await auth_client.get(f"{API}/{portfolio_id}")).status_code == 404
+
+
+async def test_delete_with_position_conflicts(
+    auth_client: httpx.AsyncClient, db_session: AsyncSession
+) -> None:
+    created = await _create(auth_client, name="alpha")
+    portfolio_id = uuid.UUID(created["id"])
+    db_session.add(
+        Position(
+            portfolio_id=portfolio_id,
+            symbol="AAPL",
+            qty=Decimal("10"),
+            avg_entry_price=Decimal("190.20"),
+        )
+    )
+    await db_session.commit()
+
+    # A portfolio referenced ONLY by a position must 409, not 500 on the FK.
+    resp = await auth_client.delete(f"{API}/{portfolio_id}")
+    assert resp.status_code == 409
 
 
 async def test_delete_cascades_credentials(
@@ -227,7 +264,7 @@ async def test_put_credentials_upserts_single_row(
     for key, secret in (("AK-one", "SK-one"), ("AK-two", "SK-two")):
         resp = await auth_client.put(
             f"{API}/{portfolio_id}/credentials",
-            json={"api_key": key, "api_secret": secret, "paper": False},
+            json={"api_key": key, "api_secret": secret, "paper": True},
         )
         assert resp.status_code == 200
 
@@ -243,7 +280,31 @@ async def test_put_credentials_upserts_single_row(
     assert len(rows) == 1
     assert decrypt_str(rows[0].api_key_encrypted) == "AK-two"
     assert decrypt_str(rows[0].api_secret_encrypted) == "SK-two"
-    assert rows[0].paper is False
+    assert rows[0].paper is True
+
+
+async def test_put_credentials_paper_key_on_live_portfolio_422(
+    auth_client: httpx.AsyncClient,
+) -> None:
+    created = await _create(auth_client, name="real-money", mode="live")
+    resp = await auth_client.put(
+        f"{API}/{created['id']}/credentials",
+        json={"api_key": "AK", "api_secret": "SK", "paper": True},
+    )
+    assert resp.status_code == 422
+    assert "mismatch" in resp.json()["detail"].lower()
+
+
+async def test_put_credentials_live_key_on_paper_portfolio_422(
+    auth_client: httpx.AsyncClient,
+) -> None:
+    created = await _create(auth_client, name="alpha", mode="paper")
+    resp = await auth_client.put(
+        f"{API}/{created['id']}/credentials",
+        json={"api_key": "AK", "api_secret": "SK", "paper": False},
+    )
+    assert resp.status_code == 422
+    assert "mismatch" in resp.json()["detail"].lower()
 
 
 # ── Bootstrap ────────────────────────────────────────────────────
