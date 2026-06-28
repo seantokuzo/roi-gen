@@ -18,14 +18,32 @@ jobs:
   review:
     runs-on: ubuntu-latest
     steps:
+      # Auth is a Claude Max-subscription OAuth token (NOT a metered API key).
+      # Generate locally with `claude setup-token`, store as the repo secret
+      # CLAUDE_CODE_OAUTH_TOKEN. Until that secret exists this job succeeds
+      # (green) and simply skips the review — no red X noise on every PR.
+      - name: Check for Claude credentials
+        id: creds
+        env:
+          OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          if [ -n "$OAUTH_TOKEN" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::CLAUDE_CODE_OAUTH_TOKEN not set — skipping auto-review. Run 'claude setup-token' (Max subscription) and add the secret to enable it."
+          fi
+
       - uses: actions/checkout@v6
+        if: steps.creds.outputs.present == 'true'
         with:
           fetch-depth: 1
 
       - name: Run Claude review
+        if: steps.creds.outputs.present == 'true'
         uses: anthropics/claude-code-action@v1
         with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           track_progress: true
           prompt: |
             REPO: ${{ github.repository }}
