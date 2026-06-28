@@ -124,6 +124,20 @@ class _suppress_cleanup_errors:  # noqa: N801 - context-manager helper
         return True
 
 
+def _log_task_death(task: asyncio.Task[None]) -> None:
+    """Surface a background task that dies UNEXPECTEDLY (not on shutdown-cancel).
+
+    Without this, a market-data consumer that crashes mid-session is collected
+    by the final ``gather(..., return_exceptions=True)`` and the engine logs a
+    clean "stopped" — hiding the fact that the feed went dark.
+    """
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        log.error("engine.task_died", task=task.get_name(), error=repr(exc))
+
+
 async def main() -> None:
     settings = get_settings()
     setup_logging(debug=settings.debug)
@@ -141,11 +155,11 @@ async def main() -> None:
 
     consumer = _build_market_data_consumer(settings, redis_client)
     tasks: list[asyncio.Task[None]] = [
-        asyncio.create_task(_heartbeat_loop(redis_client, shutdown)),
-        asyncio.create_task(_feed_status_logger(redis_client, shutdown)),
+        asyncio.create_task(_heartbeat_loop(redis_client, shutdown), name="heartbeat"),
+        asyncio.create_task(_feed_status_logger(redis_client, shutdown), name="feed_status"),
     ]
     if consumer is not None:
-        tasks.append(asyncio.create_task(consumer.start()))
+        tasks.append(asyncio.create_task(consumer.start(), name="market_data"))
         log.info(
             "engine.market_data.starting",
             symbols=list(DEFAULT_WATCHLIST),
@@ -156,6 +170,8 @@ async def main() -> None:
             "engine.market_data.disabled",
             reason="ALPACA_API_KEY/ALPACA_SECRET_KEY not set in env",
         )
+    for task in tasks:
+        task.add_done_callback(_log_task_death)
 
     log.info("engine.started", heartbeat_channel=HEARTBEAT_CHANNEL)
 

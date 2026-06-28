@@ -41,7 +41,7 @@ if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
     from app.brokers.base import BrokerAdapter
-    from app.brokers.dto import BrokerOrder, BrokerPosition
+    from app.brokers.dto import BrokerAccount, BrokerOrder, BrokerPosition
 
 log = get_logger("reconciliation")
 
@@ -147,7 +147,7 @@ class ReconciliationService:
         )
 
         positions_synced, positions_removed = await self._reconcile_positions(
-            session, portfolio_id, broker_positions
+            session, portfolio_id, account, broker_positions
         )
         orders_updated, orphans, missing = await self._reconcile_orders(
             session, portfolio_id, adapter, broker_open_orders
@@ -197,9 +197,18 @@ class ReconciliationService:
         self,
         session: AsyncSession,
         portfolio_id: uuid.UUID,
+        account: BrokerAccount,
         broker_positions: list[BrokerPosition],
     ) -> tuple[int, int]:
-        """Upsert positions the broker reports; delete locals it no longer reports."""
+        """Upsert positions the broker reports; delete locals it no longer reports.
+
+        Safety guard: an empty position list that CONTRADICTS the account
+        snapshot (broker reports no positions, yet ``position_market_value`` is
+        non-zero) is treated as a suspect/transient response — we skip all
+        deletes rather than wipe the local book on a glitch. Alpaca has a
+        documented multi-hour-outage history (project CLAUDE.md); a successful
+        but momentarily-empty body must not be read as "we went flat."
+        """
         local_positions = (
             (await session.execute(select(Position).where(Position.portfolio_id == portfolio_id)))
             .scalars()
@@ -224,6 +233,17 @@ class ReconciliationService:
                 existing.qty = bp.qty
                 existing.avg_entry_price = bp.avg_entry_price
             synced += 1
+
+        if not broker_positions and account.position_market_value != 0 and local_by_symbol:
+            # Empty list but the account still carries market value → don't trust
+            # it. Leave the local book intact for the next reconcile.
+            log.warning(
+                "reconcile.positions_suspect_empty",
+                portfolio_id=str(portfolio_id),
+                position_market_value=str(account.position_market_value),
+                local_positions=len(local_by_symbol),
+            )
+            return synced, 0
 
         # Anything local that the broker no longer reports: we're flat — remove it.
         vanished = [sym for sym in local_by_symbol if sym not in broker_symbols]

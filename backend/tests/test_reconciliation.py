@@ -40,7 +40,7 @@ from app.models.trading import Order
 from app.services.reconciliation import ReconciliationService
 
 
-def _account(equity: str = "100000.00") -> BrokerAccount:
+def _account(equity: str = "100000.00", position_market_value: str = "50000.00") -> BrokerAccount:
     return BrokerAccount(
         account_id="acct-1",
         status="ACTIVE",
@@ -49,7 +49,7 @@ def _account(equity: str = "100000.00") -> BrokerAccount:
         last_equity=Decimal("99000.00"),
         cash=Decimal("50000.00"),
         buying_power=Decimal("200000.00"),
-        position_market_value=Decimal("50000.00"),
+        position_market_value=Decimal(position_market_value),
         trading_blocked=False,
         account_blocked=False,
     )
@@ -314,6 +314,65 @@ async def test_reconcile_removes_vanished_positions(
         .all()
     }
     assert symbols == {"AAPL"}
+    assert result.positions_removed == 1
+
+
+async def test_reconcile_keeps_positions_on_suspect_empty(
+    db_session: AsyncSession, portfolio: Portfolio
+) -> None:
+    # Broker returns NO positions but the account still carries market value —
+    # a transient/glitch response. The local book must NOT be wiped.
+    db_session.add(
+        Position(
+            portfolio_id=portfolio.id,
+            symbol="AAPL",
+            qty=Decimal("10"),
+            avg_entry_price=Decimal("190.00"),
+        )
+    )
+    await db_session.commit()
+
+    adapter = FakeBrokerAdapter(
+        account=_account(position_market_value="50000.00"), positions=[], open_orders=[]
+    )
+    result = await ReconciliationService().reconcile_portfolio(db_session, portfolio.id, adapter)
+    await db_session.commit()
+
+    symbols = {
+        p.symbol
+        for p in (
+            await db_session.execute(select(Position).where(Position.portfolio_id == portfolio.id))
+        )
+        .scalars()
+        .all()
+    }
+    assert symbols == {"AAPL"}  # untouched
+    assert result.positions_removed == 0
+
+
+async def test_reconcile_flattens_positions_when_genuinely_flat(
+    db_session: AsyncSession, portfolio: Portfolio
+) -> None:
+    # Broker reports no positions AND the account shows zero market value — a
+    # genuine flat. The stale local position is removed.
+    db_session.add(
+        Position(
+            portfolio_id=portfolio.id,
+            symbol="AAPL",
+            qty=Decimal("10"),
+            avg_entry_price=Decimal("190.00"),
+        )
+    )
+    await db_session.commit()
+
+    adapter = FakeBrokerAdapter(
+        account=_account(position_market_value="0"), positions=[], open_orders=[]
+    )
+    result = await ReconciliationService().reconcile_portfolio(db_session, portfolio.id, adapter)
+    await db_session.commit()
+
+    remaining = await _counts(db_session, Position, portfolio_id=portfolio.id)
+    assert remaining == 0
     assert result.positions_removed == 1
 
 
