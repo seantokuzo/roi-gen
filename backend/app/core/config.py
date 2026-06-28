@@ -55,11 +55,16 @@ class Settings(BaseSettings):
 
     # ── Global risk defaults (per-strategy overrides live in DB) ─
     risk_per_trade_pct: Decimal = Decimal("0.75")
-    daily_loss_limit_pct: Decimal = Decimal("2.0")
+    unproven_risk_per_trade_pct: Decimal = Decimal("0.25")  # clamp until a strategy is live
+    max_risk_per_trade_pct: Decimal = Decimal("2.0")  # hard ceiling, no override exceeds it
+    daily_loss_limit_pct: Decimal = Decimal("2.0")  # portfolio-wide, % of equity
+    daily_loss_risk_multiple: Decimal = Decimal("2.5")  # per-strategy, × per-trade risk $
     max_consecutive_losses: int = 4
     drawdown_halve_pct: Decimal = Decimal("10.0")
     drawdown_halt_pct: Decimal = Decimal("15.0")
     margin_headroom_factor: Decimal = Decimal("0.85")
+    flatten_buffer_minutes: int = 5  # no new entries within N min of close
+    symbol_cooldown_seconds: int = 60  # per-symbol re-entry cooldown
 
     # ── CORS / frontend ──────────────────────────────────────────
     cors_origins: str = "http://localhost:4300,http://localhost:5173"

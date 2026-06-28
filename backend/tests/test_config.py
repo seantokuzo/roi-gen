@@ -34,11 +34,16 @@ def test_risk_defaults_are_decimal() -> None:
     settings = Settings(_env_file=None)
 
     assert settings.risk_per_trade_pct == Decimal("0.75")
+    assert settings.unproven_risk_per_trade_pct == Decimal("0.25")
+    assert settings.max_risk_per_trade_pct == Decimal("2.0")
     assert settings.daily_loss_limit_pct == Decimal("2.0")
+    assert settings.daily_loss_risk_multiple == Decimal("2.5")
     assert settings.max_consecutive_losses == 4
     assert settings.drawdown_halve_pct == Decimal("10.0")
     assert settings.drawdown_halt_pct == Decimal("15.0")
     assert settings.margin_headroom_factor == Decimal("0.85")
+    assert settings.flatten_buffer_minutes == 5
+    assert settings.symbol_cooldown_seconds == 60
     assert isinstance(settings.risk_per_trade_pct, Decimal)
 
 
