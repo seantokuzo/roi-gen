@@ -2,7 +2,9 @@
 
 > Living document. Updated at every phase transition and merged PR.
 
-## Current Phase: 1 — Domain + broker spine (PR 1b in review)
+## Current Phase: 2 — Engine + risk core (not started)
+
+Phase 1 (domain + broker spine) is **complete** — PRs #1 and #2 merged.
 
 | Date | Event |
 |---|---|
@@ -11,15 +13,15 @@
 | 2026-06-10 | Phase 0 scaffold complete: full compose stack verified healthy locally (engine heartbeat on Redis observed), CI green on main |
 | 2026-06-10 | **PR #1 merged** (Phase 1a): 10-table schema + pgvector migration, fail-closed Google→JWT auth, portfolios + Fernet-encrypted credentials. 69 tests. Cloud review unavailable — substituted 7-angle local review; fix round added DB-enforced invariants |
 | 2026-06-27 | PR auto-review rewired to authenticate via Claude **Max-subscription OAuth token** (`claude setup-token` → `CLAUDE_CODE_OAUTH_TOKEN` secret) instead of metered API key; job skips green until the secret is set |
-| 2026-06-27 | **PR 1b opened** (broker spine): BrokerAdapter contract → AlpacaBrokerAdapter (async httpx) + market-data/trade-updates stream consumers + reconciliation + account API + engine wiring. 211 tests. Verified live against Alpaca paper (REST account + md websocket connect/auth/subscribe + staleness watchdog) |
+| 2026-06-27 | **PR #2 merged** (Phase 1b broker spine): BrokerAdapter contract → AlpacaBrokerAdapter (async httpx) + market-data/trade-updates stream consumers + reconciliation + account API + engine wiring. 213 tests. Verified live against Alpaca paper (REST account incl. 4× intraday buying power, md websocket connect/auth/subscribe, staleness watchdog). Cloud review gated on OAuth token (unset) — substituted 3-agent local adversarial review + impartial judge (merge, high confidence); fixes: suspect-empty-positions guard, engine task-death logging |
 
 **Next up — Phase 2 (Engine + risk core):** event bus (MarketEvent→SignalEvent→OrderEvent→FillEvent), Strategy base class, the central Risk Engine (the iron-law #1 choke point), order state machine on top of the adapter's `submit_order` + `client_order_id`, FIFO lot→realized-P&L engine, flatten-at-close, kill switch, boot reconciliation wired into engine startup.
 
 ## Phase Tracker
 
 - [x] **Phase 0 — Scaffold**: repo, compose stack, CI, review workflow, docs ✅ 2026-06-10
-- [~] **Phase 1 — Domain + broker spine**: 1a (models/Alembic/auth/portfolios) ✅ merged; 1b (BrokerAdapter, market-data + trade-updates streams, reconciliation, account API) — PR open ← *we are here*
-- [ ] **Phase 2 — Engine + risk core**: event bus, Strategy base, Risk Engine, order state machine, FIFO P&L, kill switch
+- [x] **Phase 1 — Domain + broker spine**: 1a (models/Alembic/auth/portfolios, PR #1) + 1b (BrokerAdapter, market-data + trade-updates streams, reconciliation, account API, PR #2) ✅ 2026-06-27
+- [ ] **Phase 2 — Engine + risk core**: event bus, Strategy base, Risk Engine, order state machine, FIFO P&L, kill switch ← *next*
 - [ ] **Phase 3 — Simulator + backtest parity**
 - [ ] **Phase 4 — Strategy roster v1**: noise-area momentum, VWAP trend, regime classifier v1
 - [ ] **Phase 5 — Frontend cockpit**
