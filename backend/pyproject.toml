@@ -5,6 +5,7 @@ description = "ROI-GEN backend — FastAPI API + asyncio trading engine"
 requires-python = ">=3.12"
 dependencies = [
     "alembic>=1.18.4",
+    "alpaca-py>=0.43.4",
     "asyncpg>=0.31.0",
     "cryptography>=48.0.1",
     "fastapi>=0.136.3",
