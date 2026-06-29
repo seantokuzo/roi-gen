@@ -106,7 +106,7 @@ async def test_day_realized_pnl_respects_et_day_boundary(
     await seed_lot(
         db_session, portfolio.id, strategy.id, closed_at=yesterday, realized_pnl=Decimal("-1000")
     )
-    # A manual (no-strategy) lot closed today — in the portfolio total, not the strategy total.
+    # A manual (no-strategy) lot closed today — must NOT count in the strategy total.
     await seed_lot(
         db_session, portfolio.id, None, closed_at=DEFAULT_NOW, realized_pnl=Decimal("-20")
     )
@@ -118,8 +118,9 @@ async def test_day_realized_pnl_respects_et_day_boundary(
         strategy_id=strategy.id,
         symbol="SPY",
     )
+    # Only today's strategy lot counts: yesterday excluded by ET boundary, the
+    # manual lot excluded by strategy scope.
     assert state.day_realized_pnl_strategy == Decimal("-50")
-    assert state.day_realized_pnl_portfolio == Decimal("-70")
 
 
 async def test_consecutive_losses_counts_leading_negatives(

@@ -17,7 +17,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 from app.engine.bus import EventBus
 from app.engine.events import OrderEvent
 from app.engine.risk.engine import RiskEngine
-from app.engine.risk.state import RiskStateProvider
+from app.engine.risk.state import RiskState, RiskStateProvider
 from app.engine.stage import RiskStage
 from app.models.telemetry import EventLog
 from tests.engine.builders import FakeEngineAdapter, make_limits, make_signal
@@ -102,3 +102,38 @@ async def test_halt_flag_blocks_approval(db_engine: AsyncEngine) -> None:
     assert len(rows) == 1
     assert rows[0].payload is not None
     assert "account_tradeable" in rows[0].payload["reason"]
+
+
+class _BoomProvider(RiskStateProvider):
+    """Simulates a broker/DB failure during state load (e.g. an Alpaca timeout)."""
+
+    async def load(self, *args: object, **kwargs: object) -> RiskState:  # type: ignore[override]
+        raise RuntimeError("alpaca timeout")
+
+
+async def test_signal_error_is_audited_not_silent(db_engine: AsyncEngine) -> None:
+    factory = async_sessionmaker(db_engine, expire_on_commit=False)
+    bus = EventBus()
+    captured: list[OrderEvent] = []
+
+    async def capture(event: OrderEvent) -> None:
+        captured.append(event)
+
+    bus.subscribe(OrderEvent, capture)
+    stage = RiskStage(
+        bus=bus,
+        engine=RiskEngine(make_limits()),
+        provider=_BoomProvider(),
+        session_factory=factory,
+        adapter=FakeEngineAdapter(),
+    )
+    stage.register_handlers()
+
+    await bus.publish(make_signal())
+    await bus.drain()  # the failure must not escape the bus
+
+    assert captured == []
+    rows = await _event_log(db_engine, "order.error")
+    assert len(rows) == 1
+    assert rows[0].payload is not None
+    assert "alpaca timeout" in rows[0].payload["error"]

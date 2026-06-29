@@ -213,7 +213,6 @@ def make_state(**over: Any) -> RiskState:
         "strategy_open_qty": Decimal("0"),
         "open_positions_count": 0,
         "day_realized_pnl_strategy": Decimal("0"),
-        "day_realized_pnl_portfolio": Decimal("0"),
         "consecutive_losses": 0,
         "peak_equity": Decimal("100000"),
         "last_entry_at": None,

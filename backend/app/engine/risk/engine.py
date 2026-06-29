@@ -50,6 +50,7 @@ class RiskEngine:
 
         checks: tuple[ControlCheck, ...] = (
             controls.check_account_tradeable(state),
+            controls.check_entry_order_type(signal),
             controls.check_extended_hours(signal),
             controls.check_session_open(state, limits),
             sizing.check,
@@ -96,15 +97,11 @@ class RiskEngine:
         """Build a protected RTH bracket order (iron law #4).
 
         The stop-loss leg is mandatory (the signal carries it); take-profit is
-        optional. Extended-hours signals are rejected upstream
-        (``check_extended_hours``) until self-managed exits land in 2c, so every
-        order built here is a bracket with broker-side protection.
+        optional. Only market/limit entries reach here (``check_entry_order_type``)
+        and extended-hours signals are rejected (``check_extended_hours``), so
+        every order built here is an RTH bracket with broker-side protection.
         """
-        limit_price = (
-            signal.entry_price
-            if signal.order_type in (OrderType.limit, OrderType.stop_limit)
-            else None
-        )
+        limit_price = signal.entry_price if signal.order_type is OrderType.limit else None
         return OrderRequest(
             client_order_id=client_order_id,
             symbol=signal.symbol,

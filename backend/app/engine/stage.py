@@ -29,6 +29,7 @@ if TYPE_CHECKING:
 
     from app.brokers.base import BrokerAdapter
     from app.engine.bus import EventBus
+    from app.engine.risk.approval import RiskDecision
     from app.engine.risk.engine import RiskEngine
     from app.engine.risk.state import RiskStateProvider
 
@@ -64,67 +65,109 @@ class RiskStage:
         self._bus.subscribe(SignalEvent, self._on_signal)
 
     async def _on_signal(self, signal: SignalEvent) -> None:
-        async with self._session_factory() as session:
-            state = await self._provider.load(
-                session,
-                self._adapter,
-                portfolio_id=signal.portfolio_id,
-                strategy_id=signal.strategy_id,
-                symbol=signal.symbol,
-                trading_halted=self._halted(),
-            )
-            decision = self._engine.evaluate(signal, state)
-
-            if (
-                decision.approved
-                and decision.approval is not None
-                and decision.order_request is not None
-            ):
-                session.add(
-                    EventLog(
-                        source=EventSource.engine.value,
-                        event_type="order.approved",
-                        portfolio_id=signal.portfolio_id,
-                        strategy_id=signal.strategy_id,
-                        payload=decision.approval.audit_payload(),
-                    )
-                )
-                await session.commit()
-                log.info(
-                    "engine.risk.approved",
-                    strategy_id=str(signal.strategy_id),
+        try:
+            async with self._session_factory() as session:
+                state = await self._provider.load(
+                    session,
+                    self._adapter,
+                    portfolio_id=signal.portfolio_id,
+                    strategy_id=signal.strategy_id,
                     symbol=signal.symbol,
-                    side=signal.side.value,
-                    qty=str(decision.approval.qty),
-                    client_order_id=decision.approval.client_order_id,
+                    trading_halted=self._halted(),
                 )
-                await self._bus.publish(
-                    OrderEvent(order_request=decision.order_request, approval=decision.approval)
-                )
-                return
+                decision = self._engine.evaluate(signal, state)
+                await self._route(session, signal, decision)
+        except Exception as exc:  # noqa: BLE001 — a failed signal must be auditable, not silent
+            log.error(
+                "engine.risk.signal_error",
+                strategy_id=str(signal.strategy_id),
+                symbol=signal.symbol,
+                error=repr(exc),
+            )
+            await self._audit_error(signal, exc)
 
+    async def _route(
+        self, session: AsyncSession, signal: SignalEvent, decision: RiskDecision
+    ) -> None:
+        if (
+            decision.approved
+            and decision.approval is not None
+            and decision.order_request is not None
+        ):
             session.add(
                 EventLog(
                     source=EventSource.engine.value,
-                    event_type="order.rejected",
+                    event_type="order.approved",
                     portfolio_id=signal.portfolio_id,
                     strategy_id=signal.strategy_id,
-                    payload={
-                        "signal_id": str(signal.signal_id),
-                        "symbol": signal.symbol,
-                        "side": signal.side.value,
-                        "reason": decision.reason,
-                        "checks": [c.to_dict() for c in decision.checks],
-                    },
+                    payload=decision.approval.audit_payload(),
                 )
             )
             await session.commit()
             log.info(
-                "engine.risk.rejected",
+                "engine.risk.approved",
                 strategy_id=str(signal.strategy_id),
                 symbol=signal.symbol,
-                reason=decision.reason,
+                side=signal.side.value,
+                qty=str(decision.approval.qty),
+                client_order_id=decision.approval.client_order_id,
             )
+            await self._bus.publish(
+                OrderEvent(order_request=decision.order_request, approval=decision.approval)
+            )
+            return
+
+        session.add(
+            EventLog(
+                source=EventSource.engine.value,
+                event_type="order.rejected",
+                portfolio_id=signal.portfolio_id,
+                strategy_id=signal.strategy_id,
+                payload={
+                    "signal_id": str(signal.signal_id),
+                    "symbol": signal.symbol,
+                    "side": signal.side.value,
+                    "reason": decision.reason,
+                    "checks": [c.to_dict() for c in decision.checks],
+                },
+            )
+        )
+        await session.commit()
+        log.info(
+            "engine.risk.rejected",
+            strategy_id=str(signal.strategy_id),
+            symbol=signal.symbol,
+            reason=decision.reason,
+        )
+
+    async def _audit_error(self, signal: SignalEvent, exc: Exception) -> None:
+        """Record a signal that failed mid-evaluation (broker/DB error) as a
+        first-class ``order.error`` event rather than a vanished log line.
+
+        Retry + alerting metrics are a live-readiness concern (Phase 9); here we
+        only guarantee the drop is auditable. A fresh session is used in case the
+        original was poisoned by the failure; if even this write fails we log and
+        give up rather than raise out of the error path.
+        """
+        try:
+            async with self._session_factory() as session:
+                session.add(
+                    EventLog(
+                        source=EventSource.engine.value,
+                        event_type="order.error",
+                        portfolio_id=signal.portfolio_id,
+                        strategy_id=signal.strategy_id,
+                        payload={
+                            "signal_id": str(signal.signal_id),
+                            "symbol": signal.symbol,
+                            "side": signal.side.value,
+                            "error": repr(exc),
+                        },
+                    )
+                )
+                await session.commit()
+        except Exception:  # noqa: BLE001 — last-ditch; never raise out of the audit path
+            log.exception("engine.risk.error_audit_failed", strategy_id=str(signal.strategy_id))
 
 
 def _never_halted() -> bool:

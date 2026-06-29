@@ -24,6 +24,7 @@ from decimal import ROUND_DOWN, Decimal
 from typing import TYPE_CHECKING
 
 from app.engine.risk.approval import ControlCheck
+from app.models.enums import OrderType
 
 if TYPE_CHECKING:
     from app.core.config import Settings
@@ -31,6 +32,12 @@ if TYPE_CHECKING:
     from app.engine.risk.state import RiskState
 
 _HUNDRED = Decimal("100")
+
+# Entry order types the engine can build today. Stop / stop-limit entries need a
+# trigger price the SignalEvent does not carry (its stop_price is the protective
+# bracket leg, not an entry trigger), so they are rejected explicitly here rather
+# than silently failing OrderRequest validation downstream.
+_SUPPORTED_ENTRY_TYPES = (OrderType.market, OrderType.limit)
 
 
 @dataclass(frozen=True, slots=True)
@@ -177,6 +184,19 @@ def check_account_tradeable(state: RiskState) -> ControlCheck:
         "account_tradeable",
         passed=ok,
         detail="account and operator blocks clear" if ok else "blocked: " + ", ".join(reasons),
+    )
+
+
+def check_entry_order_type(signal: SignalEvent) -> ControlCheck:
+    ok = signal.order_type in _SUPPORTED_ENTRY_TYPES
+    return ControlCheck(
+        "entry_order_type",
+        passed=ok,
+        detail="market/limit entry"
+        if ok
+        else f"{signal.order_type.value} entries are not supported "
+        "(only market/limit; stop-triggered entries need a trigger price)",
+        observed=signal.order_type.value,
     )
 
 

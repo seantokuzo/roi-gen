@@ -79,7 +79,6 @@ class RiskState:
     strategy_open_qty: Decimal
     open_positions_count: int
     day_realized_pnl_strategy: Decimal
-    day_realized_pnl_portfolio: Decimal
     consecutive_losses: int
     peak_equity: Decimal
     last_entry_at: datetime | None
@@ -137,11 +136,6 @@ class RiskStateProvider:
             Lot.strategy_id == strategy_id,
             Lot.closed_at >= et_start,
         )
-        day_realized_portfolio = await self._sum_realized(
-            session,
-            Lot.portfolio_id == portfolio_id,
-            Lot.closed_at >= et_start,
-        )
         open_positions_count = await self._count_open_symbols(session, portfolio_id, strategy_id)
         consecutive_losses = await self._consecutive_losses(session, portfolio_id, strategy_id)
         strategy_open_qty = await self._strategy_open_qty(
@@ -170,7 +164,6 @@ class RiskStateProvider:
             strategy_open_qty=strategy_open_qty,
             open_positions_count=open_positions_count,
             day_realized_pnl_strategy=day_realized_strategy,
-            day_realized_pnl_portfolio=day_realized_portfolio,
             consecutive_losses=consecutive_losses,
             peak_equity=peak_equity,
             last_entry_at=last_entry_at,
@@ -180,8 +173,10 @@ class RiskStateProvider:
     @staticmethod
     async def _sum_realized(session: AsyncSession, *conditions: ColumnElement[bool]) -> Decimal:
         stmt = select(func.coalesce(func.sum(Lot.realized_pnl), 0)).where(*conditions)
-        val = (await session.execute(stmt)).scalar()
-        return Decimal(val) if val is not None else Decimal("0")
+        # coalesce(..., 0) makes this non-null at runtime; the guard is for mypy,
+        # which types Result.scalar() as Optional regardless.
+        total: Decimal | None = (await session.execute(stmt)).scalar()
+        return total if total is not None else Decimal("0")
 
     @staticmethod
     async def _count_open_symbols(

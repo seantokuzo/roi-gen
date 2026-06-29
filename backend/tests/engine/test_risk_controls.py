@@ -11,6 +11,7 @@ from app.engine.risk.controls import (
     check_cooldown,
     check_daily_loss,
     check_drawdown_halt,
+    check_entry_order_type,
     check_extended_hours,
     check_margin_headroom,
     check_max_positions,
@@ -18,6 +19,7 @@ from app.engine.risk.controls import (
     check_session_open,
     check_volatility_halt,
 )
+from app.models.enums import OrderType
 from tests.engine.builders import DEFAULT_NOW, make_limits, make_signal, make_state
 
 
@@ -33,6 +35,13 @@ def test_account_tradeable_blocks() -> None:
 def test_extended_hours_blocked() -> None:
     assert check_extended_hours(make_signal()).passed is True
     assert check_extended_hours(make_signal(extended_hours=True)).passed is False
+
+
+def test_entry_order_type_supports_market_and_limit_only() -> None:
+    assert check_entry_order_type(make_signal(order_type=OrderType.market)).passed is True
+    assert check_entry_order_type(make_signal(order_type=OrderType.limit)).passed is True
+    assert check_entry_order_type(make_signal(order_type=OrderType.stop)).passed is False
+    assert check_entry_order_type(make_signal(order_type=OrderType.stop_limit)).passed is False
 
 
 def test_session_open_requires_rth_outside_buffer() -> None:

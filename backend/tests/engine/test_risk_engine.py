@@ -14,7 +14,7 @@ from app.models.enums import OrderClass, OrderSide, OrderType
 from tests.engine.builders import DEFAULT_NOW, make_limits, make_signal, make_state
 
 # Every evaluation records one ControlCheck per control — the full audit trail.
-_EXPECTED_CHECK_COUNT = 12
+_EXPECTED_CHECK_COUNT = 13
 
 
 def _engine() -> RiskEngine:
@@ -80,6 +80,15 @@ def test_degenerate_stop_is_rejected_via_sizing() -> None:
     decision = _engine().evaluate(signal, make_state())
     assert decision.approved is False
     assert "sizing" in (decision.reason or "")
+
+
+def test_unsupported_entry_order_type_is_rejected_not_dropped() -> None:
+    # A stop-limit entry carries no trigger price, so it would fail OrderRequest
+    # validation and vanish on the bus. The engine rejects it explicitly instead.
+    decision = _engine().evaluate(make_signal(order_type=OrderType.stop_limit), make_state())
+    assert decision.approved is False
+    assert decision.order_request is None
+    assert "entry_order_type" in (decision.reason or "")
 
 
 def test_all_checks_recorded_even_when_rejected() -> None:
