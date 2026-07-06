@@ -159,6 +159,10 @@ class _TradingStack:
     bus: EventBus
     tu_consumer: AlpacaTradeUpdatesConsumer
     subscriber: RedisTradeUpdateSubscriber
+    # Set once boot reconciliation commits: the same "no execution before the
+    # book is reconciled" gate the fill stream gets from the subscriber's
+    # buffer applies to ORDER ENTRY via RiskStage.halted.
+    boot_reconciled: asyncio.Event = field(default_factory=asyncio.Event)
     # Tasks whose death must block new entries (feeds RiskStage.halted). The
     # list is populated in main() AFTER task creation; the halted closure built
     # in _build_trading reads it live.
@@ -195,6 +199,7 @@ def _build_trading(settings: Settings, redis: aioredis.Redis) -> _TradingStack |
     adapter = build_alpaca_adapter(creds)
     bus = EventBus()
     critical: list[asyncio.Task[None]] = []
+    boot_reconciled = asyncio.Event()
 
     risk_stage = RiskStage(
         bus=bus,
@@ -202,9 +207,11 @@ def _build_trading(settings: Settings, redis: aioredis.Redis) -> _TradingStack |
         provider=RiskStateProvider(),
         session_factory=async_session_factory,
         adapter=adapter,
-        # 2c replaces this with the kill switch; until then a dead trading task
-        # blocks new entries instead of trading deaf.
-        halted=lambda: any(task.done() for task in critical),
+        # Halted until boot reconciliation commits (an unreconciled book must
+        # not source risk state), and halted again if any trading task dies
+        # (block new entries instead of trading deaf). 2c layers the kill
+        # switch on this same hook.
+        halted=lambda: not boot_reconciled.is_set() or any(task.done() for task in critical),
     )
     risk_stage.register_handlers()
 
@@ -229,6 +236,7 @@ def _build_trading(settings: Settings, redis: aioredis.Redis) -> _TradingStack |
         bus=bus,
         tu_consumer=tu_consumer,
         subscriber=subscriber,
+        boot_reconciled=boot_reconciled,
         critical=critical,
     )
 
@@ -267,7 +275,8 @@ async def _reconcile_task(
     if shutdown.is_set():
         return
 
-    stack.subscriber.release()
+    stack.subscriber.release()  # fill stream may drain
+    stack.boot_reconciled.set()  # order entry may proceed (RiskStage un-halts)
     log.info("engine.reconcile.boot_complete", portfolio_id=str(stack.portfolio_id))
 
     interval = settings.reconcile_interval_seconds
