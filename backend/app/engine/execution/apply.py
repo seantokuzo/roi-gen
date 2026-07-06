@@ -130,10 +130,23 @@ async def persist_bracket_legs(session: AsyncSession, parent: Order, broker: Bro
     return created
 
 
+# The locked lookups MUST populate_existing: without it, a row already in the
+# session's identity map (e.g. the one ExecutionStage just persisted) is
+# returned with its STALE in-memory attributes even though the SELECT saw newer
+# DB truth — and a concurrent writer's committed state (a fill that beat the
+# submit response) would be silently regressed. Caught by
+# test_submit_response_never_regresses_a_filled_row.
+
+
 async def lock_order(session: AsyncSession, order_id: object) -> Order | None:
     """SELECT ... FOR UPDATE the order row so concurrent writers serialize."""
     return (
-        await session.execute(select(Order).where(Order.id == order_id).with_for_update())
+        await session.execute(
+            select(Order)
+            .where(Order.id == order_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
     ).scalar_one_or_none()
 
 
@@ -141,7 +154,10 @@ async def lock_order_by_client_id(session: AsyncSession, client_order_id: str) -
     """Locked lookup by the persisted-before-submit reconciliation key."""
     return (
         await session.execute(
-            select(Order).where(Order.client_order_id == client_order_id).with_for_update()
+            select(Order)
+            .where(Order.client_order_id == client_order_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
         )
     ).scalar_one_or_none()
 
@@ -150,6 +166,9 @@ async def lock_order_by_broker_id(session: AsyncSession, broker_order_id: str) -
     """Locked lookup by the broker's id (how leg events find their rows)."""
     return (
         await session.execute(
-            select(Order).where(Order.broker_order_id == broker_order_id).with_for_update()
+            select(Order)
+            .where(Order.broker_order_id == broker_order_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
         )
     ).scalar_one_or_none()

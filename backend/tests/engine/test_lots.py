@@ -299,5 +299,6 @@ async def test_fifo_tiebreak_is_deterministic_on_equal_opened_at(
     )
     # The earlier-created lot (entry 100) is consumed: (120−100)×10.
     assert result.realized_pnl == Decimal("200")
+    await db_session.flush()  # refresh() discards unflushed mutations otherwise
     await db_session.refresh(first)
     assert first.qty_open == Decimal("0")

@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING
 import pytest_asyncio
 from sqlalchemy import select
 
-from app.models.enums import OrderClass, OrderSide, OrderStatus, OrderType
+from app.models.enums import OrderClass, OrderSide, OrderStatus, OrderType, PortfolioMode
 from app.models.portfolio import Portfolio
 from app.models.telemetry import EventLog
 from app.models.trading import Fill, Lot, Order, Position
@@ -37,7 +37,7 @@ if TYPE_CHECKING:
 
 @pytest_asyncio.fixture
 async def portfolio(db_session: AsyncSession, seeded_user: User) -> Portfolio:
-    p = Portfolio(user_id=seeded_user.id, name="recon-synth")
+    p = Portfolio(user_id=seeded_user.id, name="recon-synth", mode=PortfolioMode.paper)
     db_session.add(p)
     await db_session.commit()
     await db_session.refresh(p)
@@ -299,6 +299,76 @@ async def test_done_for_day_is_dormant_and_gets_recovered(
 
     assert order.status == OrderStatus.filled.value
     assert result.fills_synthesized == 1  # the overnight fill reached the ledger
+
+
+async def test_terminal_order_with_ledger_deficit_is_swept(
+    db_session: AsyncSession, portfolio: Portfolio, seeded_user: User
+) -> None:
+    """A locally-TERMINAL order can carry a ledger deficit (the API sync
+    adopted 'filled' with no synthesis while the stream was deaf). Steps 1-2
+    skip terminal orders, so the deficit sweep must catch it — otherwise those
+    fills never reach the lot ledger."""
+    strategy = await seed_strategy(db_session, portfolio.id)
+    order = await seed_order(
+        db_session,
+        portfolio.id,
+        strategy.id,
+        broker_order_id="bo-1",
+        qty=Decimal("100"),
+        filled_qty=Decimal("100"),
+        status=OrderStatus.filled,  # terminal locally, zero Fill rows
+    )
+    await db_session.commit()
+
+    broker = make_broker_order(
+        broker_order_id="bo-1",
+        client_order_id=order.client_order_id,
+        status=OrderStatus.filled,
+        filled_qty=Decimal("100"),
+        filled_avg_price=Decimal("10"),
+    )
+    adapter = RecordingAdapter(open_orders=[], orders_by_id={"bo-1": broker})
+    result = await ReconciliationService().reconcile_portfolio(
+        db_session, portfolio.id, adapter, synthesize_fills=True
+    )
+    await db_session.commit()
+
+    assert result.fills_synthesized == 1
+    fill = (await db_session.execute(select(Fill))).scalars().one()
+    assert fill.qty == Decimal("100")
+    assert fill.price == Decimal("10")
+    lot = (await db_session.execute(select(Lot))).scalars().one()
+    assert lot.qty_open == Decimal("100")
+
+
+async def test_deficit_sweep_falls_back_to_local_columns(
+    db_session: AsyncSession, portfolio: Portfolio, seeded_user: User
+) -> None:
+    # The broker no longer returns the order at all; the order's own columns
+    # (which came from a broker snapshot) price the span.
+    strategy = await seed_strategy(db_session, portfolio.id)
+    order = await seed_order(
+        db_session,
+        portfolio.id,
+        strategy.id,
+        broker_order_id="bo-gone",
+        qty=Decimal("40"),
+        filled_qty=Decimal("40"),
+        status=OrderStatus.filled,
+    )
+    order.filled_avg_price = Decimal("25")
+    await db_session.commit()
+
+    adapter = RecordingAdapter()  # every lookup returns None
+    result = await ReconciliationService().reconcile_portfolio(
+        db_session, portfolio.id, adapter, synthesize_fills=True
+    )
+    await db_session.commit()
+
+    assert result.fills_synthesized == 1
+    fill = (await db_session.execute(select(Fill))).scalars().one()
+    assert fill.qty == Decimal("40")
+    assert fill.price == Decimal("25")
 
 
 async def test_boot_adopts_missing_leg_rows_from_nested_parents(

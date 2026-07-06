@@ -46,14 +46,14 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import TYPE_CHECKING
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 
 from app.core.logging import get_logger
 from app.engine.execution.apply import apply_snapshot, persist_bracket_legs
 from app.engine.execution.synthesis import applied_ledger, span_price, synthesize_span
 from app.models.enums import EventSource, OrderClass, OrderStatus
 from app.models.telemetry import EquitySnapshot, EventLog
-from app.models.trading import Order, Position
+from app.models.trading import Fill, Order, Position
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -151,9 +151,12 @@ class ReconciliationService:
             )
         )
 
-        positions_synced, positions_removed = await self._reconcile_positions(
-            session, portfolio_id, account, broker_positions
-        )
+        # Orders BEFORE positions — the trade-updates writer locks in that
+        # order (order row → position row) per fill, and both tasks run
+        # concurrently; touching positions first here would be the classic
+        # AB/BA lock inversion → recurring Postgres deadlocks (design review
+        # C4). The position overwrite still lands in this same transaction,
+        # so it remains authoritative over anything synthesis staged.
         orders_updated, orphans, missing, fills_synthesized = await self._reconcile_orders(
             session,
             portfolio_id,
@@ -161,6 +164,9 @@ class ReconciliationService:
             broker_open_orders,
             now=now,
             synthesize_fills=synthesize_fills,
+        )
+        positions_synced, positions_removed = await self._reconcile_positions(
+            session, portfolio_id, account, broker_positions
         )
 
         session.add(
@@ -397,7 +403,119 @@ class ReconciliationService:
             ):
                 await persist_bracket_legs(session, local, true_state)
 
+        # 3) Ledger-deficit sweep: orders whose filled_qty exceeds their fill
+        # ledger. Steps 1-2 skip locally-TERMINAL orders, but a terminal order
+        # can carry a deficit (e.g. the API sync adopted 'filled' without
+        # synthesis while the stream events were lost) — and without this
+        # sweep those fills would never reach the lot ledger.
+        if synthesize_fills:
+            synthesized += await self._sweep_ledger_deficits(
+                session, portfolio_id, adapter, now=now
+            )
+
         return updated, orphans, missing, synthesized
+
+    async def _sweep_ledger_deficits(
+        self,
+        session: AsyncSession,
+        portfolio_id: uuid.UUID,
+        adapter: BrokerAdapter,
+        *,
+        now: datetime,
+    ) -> int:
+        """Synthesize fills for any order whose ledger trails its filled_qty.
+
+        Orders already repaired earlier in this reconcile no longer show a
+        deficit (their synthetic Fill rows are flushed), so this only touches
+        genuine stragglers. Broker truth is preferred; the order's own
+        filled_qty/filled_avg_price (which themselves came from a broker
+        snapshot) are the fallback when the broker no longer returns the order.
+        """
+        ledger = (
+            select(Fill.order_id, func.sum(Fill.qty).label("applied"))
+            .group_by(Fill.order_id)
+            .subquery()
+        )
+        deficits = (
+            (
+                await session.execute(
+                    select(Order)
+                    .outerjoin(ledger, ledger.c.order_id == Order.id)
+                    .where(
+                        Order.portfolio_id == portfolio_id,
+                        Order.filled_qty > func.coalesce(ledger.c.applied, 0),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+        synthesized = 0
+        for local in deficits:
+            true_state = await self._lookup(adapter, local)
+            if true_state is not None:
+                _, synth = await self._adopt(
+                    session, local, true_state, now=now, synthesize_fills=True
+                )
+                synthesized += synth
+                continue
+            if local.filled_avg_price is None:
+                session.add(
+                    EventLog(
+                        source=EventSource.system.value,
+                        event_type="reconcile.ledger_deficit_unresolved",
+                        portfolio_id=portfolio_id,
+                        order_id=local.id,
+                        payload={
+                            "client_order_id": local.client_order_id,
+                            "filled_qty": str(local.filled_qty),
+                        },
+                    )
+                )
+                log.warning(
+                    "reconcile.ledger_deficit_unresolved",
+                    portfolio_id=str(portfolio_id),
+                    client_order_id=local.client_order_id,
+                )
+                continue
+            await session.refresh(local, with_for_update=True)
+            applied = await applied_ledger(session, local.id)
+            delta = local.filled_qty - applied.qty
+            if delta <= 0:  # repaired concurrently
+                continue
+            price = span_price(
+                cum_qty=local.filled_qty,
+                cum_avg_price=local.filled_avg_price,
+                applied=applied,
+                span_qty=delta,
+            )
+            fill = await synthesize_span(
+                session,
+                local,
+                span_qty=delta,
+                price=price,
+                occurred_at=local.filled_at or now,
+                tag="recon",
+                apply_position=False,
+            )
+            if fill is not None:
+                synthesized += 1
+                session.add(
+                    EventLog(
+                        source=EventSource.system.value,
+                        event_type="reconcile.fill_synthesized",
+                        portfolio_id=portfolio_id,
+                        strategy_id=local.strategy_id,
+                        order_id=local.id,
+                        payload={
+                            "qty": str(delta),
+                            "price": str(price),
+                            "source": "local_columns_fallback",
+                        },
+                    )
+                )
+        return synthesized
 
     @staticmethod
     async def _lookup(adapter: BrokerAdapter, local: Order) -> BrokerOrder | None:
@@ -422,6 +540,32 @@ class ReconciliationService:
         fills the ledger never saw. Returns ``(changed, fills_synthesized)``."""
         await session.refresh(local, with_for_update=True)
         before = (local.status, local.filled_qty, local.broker_order_id)
+
+        if local.status == OrderStatus.failed.value:
+            # We guessed "not placed"; the broker just reported the order.
+            # ``failed`` is soft-terminal — broker reality trumps the guess
+            # (mirrors the trade-updates writer's resurrection path).
+            local.status = OrderStatus.pending_submit.value
+            session.add(
+                EventLog(
+                    source=EventSource.broker.value,
+                    event_type="order.failed_resurrected",
+                    portfolio_id=local.portfolio_id,
+                    strategy_id=local.strategy_id,
+                    order_id=local.id,
+                    payload={
+                        "client_order_id": local.client_order_id,
+                        "broker_order_id": broker.broker_order_id,
+                        "broker_status": broker.status.value,
+                        "via": "reconciliation",
+                    },
+                )
+            )
+            log.warning(
+                "reconcile.failed_resurrected",
+                client_order_id=local.client_order_id,
+                broker_status=broker.status.value,
+            )
 
         synthesized = 0
         if synthesize_fills:

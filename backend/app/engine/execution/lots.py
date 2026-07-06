@@ -77,6 +77,12 @@ async def apply_fill_to_lots(
     serialization it needs (the writers lock the Order row).
     """
     opposite = OrderSide.sell if side is OrderSide.buy else OrderSide.buy
+    # FOR UPDATE: the Order-row locks writers hold only serialize fills of the
+    # SAME order — two writers filling DIFFERENT orders in this same
+    # (portfolio, strategy, symbol) scope (live writer vs periodic-reconcile
+    # synthesis) would otherwise read-modify-write the same lot concurrently
+    # and double-book realized P&L. The deterministic ORDER BY keeps lock
+    # acquisition order consistent across writers (no deadlock by ordering).
     open_lots = (
         (
             await session.execute(
@@ -89,6 +95,8 @@ async def apply_fill_to_lots(
                     Lot.qty_open > 0,
                 )
                 .order_by(Lot.opened_at, Lot.created_at, Lot.id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
             )
         )
         .scalars()

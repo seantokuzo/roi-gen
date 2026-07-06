@@ -341,6 +341,50 @@ async def test_gap_in_cumulative_synthesizes_the_missed_span(
     assert len(events) == 1
 
 
+async def test_cancel_event_carrying_unseen_cumulative_synthesizes_before_absorbing(
+    db_engine: AsyncEngine, db_session: AsyncSession, seeded_user: User
+) -> None:
+    """C2: the partial-fill event was dropped; the CANCELED event is the first
+    place the 50 filled shares surface (cumulative only, no execution). The
+    writer must synthesize the span BEFORE adopting the absorbing status, or
+    the quantity never reaches lots."""
+    portfolio, strategy = await _scope(db_session, seeded_user)
+    order = await seed_order(
+        db_session, portfolio.id, strategy.id, broker_order_id="bo-1", qty=Decimal("250")
+    )
+    await db_session.commit()
+    stage, bus, fills = _wired(db_engine)
+
+    await stage.on_trade_update(
+        make_trade_update(
+            event="canceled",
+            execution_id=None,
+            qty=None,
+            price=None,
+            position_qty=None,
+            order=make_broker_order(
+                status=OrderStatus.canceled,
+                filled_qty=Decimal("50"),
+                filled_avg_price=Decimal("101"),
+            ),
+        )
+    )
+    await bus.drain()
+
+    ledger = await _all(db_engine, Fill, order_id=order.id)
+    assert len(ledger) == 1
+    assert ledger[0].qty == Decimal("50")
+    assert ledger[0].price == Decimal("101")
+    assert ledger[0].broker_fill_id is not None
+    assert ledger[0].broker_fill_id.startswith("gap-")
+
+    lots = await _all(db_engine, Lot, portfolio_id=portfolio.id)
+    assert sum(lot.qty_open for lot in lots) == Decimal("50")  # nothing lost
+    updated = await _one(db_engine, Order, id=order.id)
+    assert updated.status == OrderStatus.canceled.value  # then absorbed
+    assert fills == []  # gap synthesis is catch-up accounting, not a FillEvent
+
+
 async def test_failed_order_is_resurrected_by_broker_evidence(
     db_engine: AsyncEngine, db_session: AsyncSession, seeded_user: User
 ) -> None:

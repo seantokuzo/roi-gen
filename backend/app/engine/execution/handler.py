@@ -44,6 +44,7 @@ from app.engine.execution.apply import (
     lock_order_by_client_id,
     persist_bracket_legs,
 )
+from app.engine.risk.approval import RiskApproval as _RiskApproval
 from app.models.enums import EventSource, OrderClass, OrderStatus
 from app.models.telemetry import EventLog
 from app.models.trading import Order
@@ -97,6 +98,15 @@ class ExecutionStage:
         req = event.order_request
         approval = event.approval
         try:
+            if not isinstance(approval, _RiskApproval):
+                # The mint guard stops forged RiskApprovals; this stops
+                # duck-typed impostors that never went through the constructor.
+                log.error(
+                    "engine.execution.approval_not_minted",
+                    client_order_id=req.client_order_id,
+                    approval_type=type(approval).__name__,
+                )
+                return
             mismatch = _pairing_mismatch(req, approval)
             if mismatch is not None:
                 log.error(

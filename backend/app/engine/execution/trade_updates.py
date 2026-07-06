@@ -60,6 +60,7 @@ from app.models.trading import Fill, Order
 if TYPE_CHECKING:
     import uuid
     from collections.abc import Sequence
+    from datetime import datetime
     from decimal import Decimal
 
     import redis.asyncio as aioredis
@@ -237,14 +238,29 @@ class TradeUpdateStage:
         even when the status snapshot is stale or the row already absorbed.
         The effective applied quantity is clamped to the cumulative delta, so
         replays and synthesis overlaps can never double-apply lots.
+
+        NON-fill events run gap detection too: a ``canceled``/``expired`` event
+        can be the FIRST place a dropped partial fill surfaces (as cumulative
+        ``filled_qty`` with no execution attached). Skipping it would adopt an
+        absorbing status over an under-applied ledger — quantity permanently
+        lost to lots (design review C2).
         """
         if update.qty is None or update.price is None:
+            await self._synthesize_gap(
+                session,
+                order,
+                expected_prior=update.order.filled_qty,
+                prior_avg=update.order.filled_avg_price,
+                occurred_at=update.timestamp,
+                broker_cum=update.order.filled_qty,
+            )
             return None
 
         side = OrderSide(order.side)
         fill_key = update.execution_id
         if fill_key is None:
-            fill_key = f"noexec-{order.id}-{update.order.filled_qty.normalize()}"
+            cum_key = format(update.order.filled_qty.normalize(), "f")
+            fill_key = f"noexec-{order.id}-{cum_key}"
             session.add(
                 EventLog(
                     source=EventSource.broker.value,
@@ -270,44 +286,19 @@ class TradeUpdateStage:
             )
             return None
 
-        applied = await applied_ledger(session, order.id)
         cum = update.order.filled_qty
 
         # Gap: the broker's cumulative minus this execution exceeds what the
         # ledger has seen → events were dropped. Synthesize the gap first.
-        expected_prior = cum - update.qty
-        if applied.qty < expected_prior:
-            gap_qty = expected_prior - applied.qty
-            price = span_price(
-                cum_qty=expected_prior,
-                cum_avg_price=self._prior_avg(update),
-                applied=applied,
-                span_qty=gap_qty,
-            )
-            await synthesize_span(
-                session,
-                order,
-                span_qty=gap_qty,
-                price=price,
-                occurred_at=update.timestamp,
-                tag="gap",
-                apply_position=True,
-            )
-            session.add(
-                EventLog(
-                    source=EventSource.engine.value,
-                    event_type="trade_update.gap_synthesized",
-                    portfolio_id=order.portfolio_id,
-                    strategy_id=order.strategy_id,
-                    order_id=order.id,
-                    payload={
-                        "gap_qty": str(gap_qty),
-                        "price": str(price),
-                        "broker_cumulative": str(cum),
-                    },
-                )
-            )
-            applied = await applied_ledger(session, order.id)
+        await self._synthesize_gap(
+            session,
+            order,
+            expected_prior=cum - update.qty,
+            prior_avg=self._prior_avg(update),
+            occurred_at=update.timestamp,
+            broker_cum=cum,
+        )
+        applied = await applied_ledger(session, order.id)
 
         effective = min(update.qty, cum - applied.qty)
         if effective <= 0:
@@ -382,6 +373,51 @@ class TradeUpdateStage:
             strategy_id=order.strategy_id,
         )
 
+    async def _synthesize_gap(
+        self,
+        session: AsyncSession,
+        order: Order,
+        *,
+        expected_prior: Decimal,
+        prior_avg: Decimal | None,
+        occurred_at: datetime,
+        broker_cum: Decimal,
+    ) -> None:
+        """Back-fill any span the fill ledger never saw, up to ``expected_prior``."""
+        applied = await applied_ledger(session, order.id)
+        if applied.qty >= expected_prior:
+            return
+        gap_qty = expected_prior - applied.qty
+        price = span_price(
+            cum_qty=expected_prior,
+            cum_avg_price=prior_avg,
+            applied=applied,
+            span_qty=gap_qty,
+        )
+        await synthesize_span(
+            session,
+            order,
+            span_qty=gap_qty,
+            price=price,
+            occurred_at=occurred_at,
+            tag="gap",
+            apply_position=True,
+        )
+        session.add(
+            EventLog(
+                source=EventSource.engine.value,
+                event_type="trade_update.gap_synthesized",
+                portfolio_id=order.portfolio_id,
+                strategy_id=order.strategy_id,
+                order_id=order.id,
+                payload={
+                    "gap_qty": str(gap_qty),
+                    "price": str(price),
+                    "broker_cumulative": str(broker_cum),
+                },
+            )
+        )
+
     @staticmethod
     def _prior_avg(update: TradeUpdate) -> Decimal | None:
         """Cumulative average BEFORE this execution, backed out of the update."""
@@ -412,7 +448,15 @@ class TradeUpdateStage:
             return
         if order.broker_order_id is None:  # pragma: no cover — guarded by caller
             return
-        nested = await self._adapter.get_order(order.broker_order_id)
+        try:
+            nested = await self._adapter.get_order(order.broker_order_id)
+        except Exception as exc:  # noqa: BLE001 — a leg-fetch blip must not roll back the fill
+            log.warning(
+                "engine.trade_updates.leg_fetch_failed",
+                client_order_id=order.client_order_id,
+                error=repr(exc),
+            )
+            return  # the next event or reconcile retries; the fill txn survives
         if nested is None or not nested.legs:
             return
         created = await persist_bracket_legs(session, order, nested)

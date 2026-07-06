@@ -79,25 +79,51 @@ def span_price(
     applied: AppliedLedger,
     span_qty: Decimal,
 ) -> Decimal:
-    """Back the missed span's average price out of the notional difference."""
+    """Back the missed span's average price out of the notional difference.
+
+    Guarded: Fill.price is stored at Numeric(18,6), so the applied-notional
+    cursor carries rounding at the micro-dollar level — dividing a tiny
+    residual by a tiny ``span_qty`` could amplify that into a nonsense (even
+    negative) price. A non-positive derivation falls back to the broker's
+    cumulative average, loudly.
+    """
     if span_qty <= 0:
         msg = "span_qty must be positive"
         raise ValueError(msg)
     if cum_avg_price is None:
         # No broker average at all (shouldn't happen for a filled span); the
         # only price we have is what we recorded — degenerate to it, or zero
-        # cost basis if nothing was recorded. Callers log this.
+        # cost basis if nothing was recorded.
+        log.warning(
+            "engine.synthesis.no_cumulative_avg",
+            applied_qty=str(applied.qty),
+            span_qty=str(span_qty),
+        )
         if applied.qty > 0:
             return applied.notional / applied.qty
         return Decimal("0")
     if applied.qty == 0:
         return cum_avg_price  # exact: the span IS the whole cumulative fill
-    return (cum_qty * cum_avg_price - applied.notional) / span_qty
+    derived = (cum_qty * cum_avg_price - applied.notional) / span_qty
+    if derived <= 0:
+        log.warning(
+            "engine.synthesis.degenerate_span_price",
+            derived=str(derived),
+            fallback=str(cum_avg_price),
+            span_qty=str(span_qty),
+        )
+        return cum_avg_price
+    return derived
 
 
 def synthetic_fill_id(tag: str, order_id: uuid.UUID, cumulative: Decimal) -> str:
-    """Deterministic id for a synthesized fill (idempotent under the unique index)."""
-    return f"{tag}-{order_id}-{cumulative.normalize()}"
+    """Deterministic id for a synthesized fill (idempotent under the unique index).
+
+    ``normalize()`` canonicalizes trailing zeros (``250`` == ``250.000000000``)
+    so the same span from any code path yields the same id; ``format(..., 'f')``
+    keeps it plain digits (normalize alone renders ``2.5E+2``).
+    """
+    return f"{tag}-{order_id}-{format(cumulative.normalize(), 'f')}"
 
 
 async def synthesize_span(
