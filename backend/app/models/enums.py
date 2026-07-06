@@ -53,9 +53,17 @@ class TimeInForce(StrEnum):
 
 
 class OrderStatus(StrEnum):
-    """Order lifecycle states (superset of Alpaca's, plus pending_submit)."""
+    """Order lifecycle states (superset of Alpaca's, plus pending_submit/failed).
+
+    ``pending_submit`` and ``failed`` are local-only: ``pending_submit`` is the
+    persist-before-submit anchor, and ``failed`` means the submit provably never
+    reached the broker (transport refusal / rate-limited before processing) or
+    aged out unresolved. ``failed`` is *soft*-terminal — broker evidence for the
+    ``client_order_id`` resurrects it, because broker reality trumps a local guess.
+    """
 
     pending_submit = "pending_submit"
+    failed = "failed"
     submitted = "submitted"
     accepted = "accepted"
     partially_filled = "partially_filled"

@@ -15,6 +15,7 @@ from tests.engine.builders import (
     make_clock,
     seed_equity_snapshot,
     seed_lot,
+    seed_lot_close,
     seed_portfolio,
     seed_strategy,
 )
@@ -95,21 +96,33 @@ async def test_account_and_clock_snapshot_flow_through(
 async def test_day_realized_pnl_respects_et_day_boundary(
     db_session: AsyncSession, seeded_user: User
 ) -> None:
+    """Day P&L reads the per-close ledger (lot_closes), not the lot accumulator —
+    so partial closes count same-day and multi-day lots attribute per close."""
     portfolio = await seed_portfolio(db_session, seeded_user.id)
     strategy = await seed_strategy(db_session, portfolio.id)
-    # Closed today (11:00 ET) — counts.
-    await seed_lot(
-        db_session, portfolio.id, strategy.id, closed_at=DEFAULT_NOW, realized_pnl=Decimal("-50")
+    # A PARTIAL close today (lot still open, closed_at NULL) — must still count.
+    open_lot = await seed_lot(
+        db_session, portfolio.id, strategy.id, qty_open=Decimal("5"), realized_pnl=Decimal("-30")
     )
+    await seed_lot_close(
+        db_session, open_lot, qty=Decimal("5"), realized_pnl=Decimal("-30"), closed_at=DEFAULT_NOW
+    )
+    # A full close today.
+    closed_lot = await seed_lot(
+        db_session, portfolio.id, strategy.id, closed_at=DEFAULT_NOW, realized_pnl=Decimal("-20")
+    )
+    await seed_lot_close(db_session, closed_lot, realized_pnl=Decimal("-20"), closed_at=DEFAULT_NOW)
     # Closed yesterday evening ET (2026-06-25 19:00 ET = 23:00 UTC) — excluded.
     yesterday = datetime(2026, 6, 25, 23, 0, tzinfo=UTC)
-    await seed_lot(
+    old_lot = await seed_lot(
         db_session, portfolio.id, strategy.id, closed_at=yesterday, realized_pnl=Decimal("-1000")
     )
-    # A manual (no-strategy) lot closed today — must NOT count in the strategy total.
-    await seed_lot(
-        db_session, portfolio.id, None, closed_at=DEFAULT_NOW, realized_pnl=Decimal("-20")
+    await seed_lot_close(db_session, old_lot, realized_pnl=Decimal("-1000"), closed_at=yesterday)
+    # A manual (no-strategy) close today — must NOT count in the strategy total.
+    manual_lot = await seed_lot(
+        db_session, portfolio.id, None, closed_at=DEFAULT_NOW, realized_pnl=Decimal("-7")
     )
+    await seed_lot_close(db_session, manual_lot, realized_pnl=Decimal("-7"), closed_at=DEFAULT_NOW)
 
     state = await provider.load(
         db_session,
@@ -118,8 +131,8 @@ async def test_day_realized_pnl_respects_et_day_boundary(
         strategy_id=strategy.id,
         symbol="SPY",
     )
-    # Only today's strategy lot counts: yesterday excluded by ET boundary, the
-    # manual lot excluded by strategy scope.
+    # Today's strategy closes count (-30 partial + -20 full): yesterday excluded
+    # by ET boundary, the manual close excluded by strategy scope.
     assert state.day_realized_pnl_strategy == Decimal("-50")
 
 

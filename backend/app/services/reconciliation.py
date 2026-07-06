@@ -9,14 +9,30 @@ event left stale).
 This module is **read / diff / persist ONLY**. It NEVER submits or cancels an
 order — that capability lives behind the execution handler and the risk engine
 (iron law #1). The only broker calls here are reads (``get_account``,
-``list_positions``, ``list_orders``, ``get_order_by_client_id``).
+``list_positions``, ``list_orders``, ``get_order``, ``get_order_by_client_id``).
 
-Post-restart order recovery (the "what happened while we were down" case): a
-local order in a non-terminal status that the broker does NOT list as open is
-looked up by its ``client_order_id`` — the reconciliation key persisted before
-submission — and adopted at its true terminal state. If even that lookup comes
-back empty the order is left UNTOUCHED and an audit row is written; we never
-guess an order's fate (iron law spirit: ambiguity is reconciled, not assumed).
+Concurrency: the engine's trade-updates writer runs while periodic reconciles
+do. Every order mutation here happens under ``SELECT … FOR UPDATE`` and routes
+state through the shared transition rules
+(:mod:`app.engine.execution.state`) — a stale REST snapshot must never clobber
+newer stream truth (verified design-review finding).
+
+Missed-fill synthesis (``synthesize_fills=True``, the engine's mode): executions
+that printed while we were deaf exist only as the broker's cumulative
+``filled_qty``. The detection cursor is ``SUM(Fill.qty)`` per order — the
+durable fill ledger, never ``Order.filled_qty`` — and the synthetic fill + FIFO
+lot application land in the SAME transaction as the order update, so a crash
+can't separate evidence from ledger. Synthesis never touches Position rows:
+the broker position overwrite in this same transaction already includes the
+missed quantity.
+
+Post-restart order recovery: a local order in a non-absorbing status that the
+broker does NOT list as open is looked up (by ``broker_order_id`` when we have
+one — it works for bracket legs and returns nested children — else by
+``client_order_id``, the key persisted before submission) and adopted at its
+true state. A ``pending_submit`` row with no ``broker_order_id`` that the
+broker has never heard of ages into ``failed`` after a grace window; anything
+else unknown is left UNTOUCHED and audited — we never guess an order's fate.
 
 All writes go to the passed ``session``; the caller owns the transaction and
 commits (repo convention: ``get_db`` does not commit — endpoints do).
@@ -26,14 +42,16 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import TYPE_CHECKING
 
 from sqlalchemy import delete, select
 
 from app.core.logging import get_logger
-from app.models.enums import EventSource, OrderStatus
+from app.engine.execution.apply import apply_snapshot, persist_bracket_legs
+from app.engine.execution.synthesis import applied_ledger, span_price, synthesize_span
+from app.models.enums import EventSource, OrderClass, OrderStatus
 from app.models.telemetry import EquitySnapshot, EventLog
 from app.models.trading import Order, Position
 
@@ -45,8 +63,12 @@ if TYPE_CHECKING:
 
 log = get_logger("reconciliation")
 
-# Statuses the broker considers "done" — it will not list these as open. Any
-# local order in one of these is already settled; nothing to recover.
+# Statuses with no transitions out (shared with the order state machine).
+# ``done_for_day`` and ``stopped`` are deliberately NOT here: done_for_day is
+# dormancy (a GTC order fills next session) and stopped means a fill is
+# guaranteed but hasn't printed — treating either as final would skip the
+# recovery lookup that finds those fills. ``failed`` IS here (provably never
+# placed); the broker-open match above still rescues one that materializes.
 TERMINAL_STATUSES: frozenset[OrderStatus] = frozenset(
     {
         OrderStatus.filled,
@@ -54,10 +76,14 @@ TERMINAL_STATUSES: frozenset[OrderStatus] = frozenset(
         OrderStatus.expired,
         OrderStatus.rejected,
         OrderStatus.replaced,
-        OrderStatus.done_for_day,
-        OrderStatus.stopped,
+        OrderStatus.failed,
     }
 )
+
+# A pending_submit row with no broker_order_id whose client id the broker does
+# not recognize is declared failed after this age — long past any submit
+# latency, short enough that the row can't wedge the reconciler forever.
+_NEVER_SUBMITTED_GRACE = timedelta(seconds=120)
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,6 +96,7 @@ class ReconcileResult:
     orders_updated: int
     orphans: int
     missing: int
+    fills_synthesized: int
     equity: Decimal
 
 
@@ -81,34 +108,6 @@ def _is_terminal(status: str) -> bool:
         # Unknown/garbage status: treat as non-terminal so it gets investigated
         # rather than silently skipped.
         return False
-
-
-def _apply_broker_order(local: Order, broker: BrokerOrder) -> bool:
-    """Copy mutable broker order fields onto ``local``; return whether anything changed."""
-    changed = False
-    new_status = broker.status.value
-    if local.status != new_status:
-        local.status = new_status
-        changed = True
-    if local.filled_qty != broker.filled_qty:
-        local.filled_qty = broker.filled_qty
-        changed = True
-    if broker.filled_avg_price is not None and local.filled_avg_price != broker.filled_avg_price:
-        local.filled_avg_price = broker.filled_avg_price
-        changed = True
-    if local.broker_order_id != broker.broker_order_id:
-        local.broker_order_id = broker.broker_order_id
-        changed = True
-    if broker.submitted_at is not None and local.submitted_at != broker.submitted_at:
-        local.submitted_at = broker.submitted_at
-        changed = True
-    if broker.filled_at is not None and local.filled_at != broker.filled_at:
-        local.filled_at = broker.filled_at
-        changed = True
-    if broker.canceled_at is not None and local.canceled_at != broker.canceled_at:
-        local.canceled_at = broker.canceled_at
-        changed = True
-    return changed
 
 
 class ReconciliationService:
@@ -123,11 +122,17 @@ class ReconciliationService:
         session: AsyncSession,
         portfolio_id: uuid.UUID,
         adapter: BrokerAdapter,
+        *,
+        synthesize_fills: bool = False,
     ) -> ReconcileResult:
         """Reconcile ``portfolio_id`` against ``adapter``; return outcome counts.
 
         Writes (equity snapshot, position upserts/deletes, order updates, audit
-        rows) are staged on ``session``; the CALLER commits.
+        rows, synthetic fills + lots when ``synthesize_fills``) are staged on
+        ``session``; the CALLER commits. ``synthesize_fills`` is the engine's
+        mode — the API sync endpoint leaves it off (no lot side-effects from a
+        UI action; the engine's next reconcile still catches everything,
+        because the detection cursor is the fill ledger, not order columns).
         """
         account = await adapter.get_account()
         broker_positions = await adapter.list_positions()
@@ -149,8 +154,13 @@ class ReconciliationService:
         positions_synced, positions_removed = await self._reconcile_positions(
             session, portfolio_id, account, broker_positions
         )
-        orders_updated, orphans, missing = await self._reconcile_orders(
-            session, portfolio_id, adapter, broker_open_orders
+        orders_updated, orphans, missing, fills_synthesized = await self._reconcile_orders(
+            session,
+            portfolio_id,
+            adapter,
+            broker_open_orders,
+            now=now,
+            synthesize_fills=synthesize_fills,
         )
 
         session.add(
@@ -164,6 +174,7 @@ class ReconciliationService:
                     "orders_updated": orders_updated,
                     "orphans": orphans,
                     "missing": missing,
+                    "fills_synthesized": fills_synthesized,
                     "equity": str(account.equity),
                     "cash": str(account.cash),
                     "buying_power": str(account.buying_power),
@@ -180,6 +191,7 @@ class ReconciliationService:
             orders_updated=orders_updated,
             orphans=orphans,
             missing=missing,
+            fills_synthesized=fills_synthesized,
             equity=str(account.equity),
         )
 
@@ -190,6 +202,7 @@ class ReconciliationService:
             orders_updated=orders_updated,
             orphans=orphans,
             missing=missing,
+            fills_synthesized=fills_synthesized,
             equity=account.equity,
         )
 
@@ -263,10 +276,13 @@ class ReconciliationService:
         portfolio_id: uuid.UUID,
         adapter: BrokerAdapter,
         broker_open_orders: list[BrokerOrder],
-    ) -> tuple[int, int, int]:
+        *,
+        now: datetime,
+        synthesize_fills: bool,
+    ) -> tuple[int, int, int, int]:
         """Diff broker-open orders against locals; recover non-terminal stragglers.
 
-        Returns ``(orders_updated, orphans, missing)``.
+        Returns ``(orders_updated, orphans, missing, fills_synthesized)``.
         """
         local_orders = (
             (await session.execute(select(Order).where(Order.portfolio_id == portfolio_id)))
@@ -276,18 +292,50 @@ class ReconciliationService:
         local_by_broker_id = {o.broker_order_id: o for o in local_orders if o.broker_order_id}
         local_by_client_id = {o.client_order_id: o for o in local_orders}
 
-        updated = 0
-        orphans = 0
-        matched_local_ids: set[uuid.UUID] = set()
-
-        # 1) Each broker-open order → find its local twin (broker id, then client id).
-        for bo in broker_open_orders:
+        def _find_local(bo: BrokerOrder) -> Order | None:
             local = local_by_broker_id.get(bo.broker_order_id)
             if local is None and bo.client_order_id is not None:
                 local = local_by_client_id.get(bo.client_order_id)
+            return local
+
+        updated = 0
+        orphans = 0
+        synthesized = 0
+        matched_local_ids: set[uuid.UUID] = set()
+
+        # 1) Each broker-open order (parents AND their nested legs) → local twin.
+        flat: list[tuple[BrokerOrder, BrokerOrder | None]] = []
+        for bo in broker_open_orders:
+            flat.append((bo, None))
+            flat.extend((leg, bo) for leg in bo.legs)
+
+        for bo, parent_bo in flat:
+            local = _find_local(bo)
+            if local is None and parent_bo is not None:
+                # A leg with no local row but a known local parent: adopt it —
+                # its fills are how protective exits reach the lot ledger.
+                local_parent = _find_local(parent_bo)
+                if local_parent is not None:
+                    created = await persist_bracket_legs(session, local_parent, parent_bo)
+                    if created:
+                        await session.flush()
+                        local = (
+                            await session.execute(
+                                select(Order).where(Order.broker_order_id == bo.broker_order_id)
+                            )
+                        ).scalar_one_or_none()
+                        if local is not None:
+                            if local.broker_order_id:
+                                local_by_broker_id[local.broker_order_id] = local
+                            local_by_client_id[local.client_order_id] = local
+                            log.info(
+                                "reconcile.leg_adopted",
+                                portfolio_id=str(portfolio_id),
+                                broker_order_id=bo.broker_order_id,
+                            )
             if local is None:
-                # No local row → an order placed outside the system (manual / legacy
-                # / another process). Record it; never act on it here.
+                # No local row → an order placed outside the system (manual /
+                # legacy / another process). Record it; never act on it here.
                 orphans += 1
                 session.add(
                     EventLog(
@@ -314,50 +362,171 @@ class ReconciliationService:
                 continue
 
             matched_local_ids.add(local.id)
-            if _apply_broker_order(local, bo):
-                updated += 1
+            changed, synth = await self._adopt(
+                session, local, bo, now=now, synthesize_fills=synthesize_fills
+            )
+            updated += int(changed)
+            synthesized += synth
 
-        # 2) Local non-terminal orders the broker did NOT list as open. Either they
-        # reached a terminal state while we were down, or the lookup is unknown.
-        open_broker_ids = {bo.broker_order_id for bo in broker_open_orders}
+        # 2) Local non-terminal orders the broker did NOT list as open. Either
+        # they reached a terminal state while we were down, or the lookup is
+        # unknown.
+        open_broker_ids = {bo.broker_order_id for bo, _ in flat}
         missing = 0
         for local in local_orders:
             if local.id in matched_local_ids:
                 continue
             if _is_terminal(local.status):
                 continue
-            # Belt-and-suspenders: skip if it was actually in the broker-open set
-            # under its broker id (shouldn't happen given step 1, but cheap).
             if local.broker_order_id and local.broker_order_id in open_broker_ids:
                 continue
 
-            true_state = await adapter.get_order_by_client_id(local.client_order_id)
+            true_state = await self._lookup(adapter, local)
             if true_state is None:
-                # Broker has no record under our client id. Do NOT guess — record
-                # and leave status untouched for human / later inspection.
-                missing += 1
+                missing += await self._handle_unknown(session, portfolio_id, local, now=now)
+                continue
+            changed, synth = await self._adopt(
+                session, local, true_state, now=now, synthesize_fills=synthesize_fills
+            )
+            updated += int(changed)
+            synthesized += synth
+            if (
+                true_state.order_class is OrderClass.bracket
+                and local.parent_order_id is None
+                and true_state.legs
+            ):
+                await persist_bracket_legs(session, local, true_state)
+
+        return updated, orphans, missing, synthesized
+
+    @staticmethod
+    async def _lookup(adapter: BrokerAdapter, local: Order) -> BrokerOrder | None:
+        """Recover an order's true state — broker id first (works for legs and
+        returns nested children), client id as the pre-submit-crash fallback."""
+        if local.broker_order_id:
+            found = await adapter.get_order(local.broker_order_id)
+            if found is not None:
+                return found
+        return await adapter.get_order_by_client_id(local.client_order_id)
+
+    async def _adopt(
+        self,
+        session: AsyncSession,
+        local: Order,
+        broker: BrokerOrder,
+        *,
+        now: datetime,
+        synthesize_fills: bool,
+    ) -> tuple[bool, int]:
+        """Apply broker truth onto ``local`` under a row lock, synthesizing any
+        fills the ledger never saw. Returns ``(changed, fills_synthesized)``."""
+        await session.refresh(local, with_for_update=True)
+        before = (local.status, local.filled_qty, local.broker_order_id)
+
+        synthesized = 0
+        if synthesize_fills:
+            applied = await applied_ledger(session, local.id)
+            delta = broker.filled_qty - applied.qty
+            if delta > 0:
+                price = span_price(
+                    cum_qty=broker.filled_qty,
+                    cum_avg_price=broker.filled_avg_price,
+                    applied=applied,
+                    span_qty=delta,
+                )
+                fill = await synthesize_span(
+                    session,
+                    local,
+                    span_qty=delta,
+                    price=price,
+                    occurred_at=broker.filled_at or now,
+                    tag="recon",
+                    apply_position=False,
+                )
+                if fill is not None:
+                    synthesized = 1
+                    session.add(
+                        EventLog(
+                            source=EventSource.system.value,
+                            event_type="reconcile.fill_synthesized",
+                            portfolio_id=local.portfolio_id,
+                            strategy_id=local.strategy_id,
+                            order_id=local.id,
+                            payload={
+                                "qty": str(delta),
+                                "price": str(price),
+                                "broker_cumulative": str(broker.filled_qty),
+                            },
+                        )
+                    )
+
+        apply_snapshot(local, broker)
+        changed = before != (local.status, local.filled_qty, local.broker_order_id)
+        return changed, synthesized
+
+    async def _handle_unknown(
+        self,
+        session: AsyncSession,
+        portfolio_id: uuid.UUID,
+        local: Order,
+        *,
+        now: datetime,
+    ) -> int:
+        """The broker has no record of a non-terminal local order.
+
+        A ``pending_submit`` row that never got a ``broker_order_id`` and has
+        aged past the grace window provably never landed (the client-id lookup
+        is authoritative for orders we key ourselves) → ``failed``. Anything
+        else is left untouched and audited — never guess.
+        Returns 1 when the order remains unresolved (the ``missing`` count).
+        """
+        age_ok = local.created_at is not None and (now - local.created_at) > _NEVER_SUBMITTED_GRACE
+        if (
+            local.status == OrderStatus.pending_submit.value
+            and local.broker_order_id is None
+            and age_ok
+        ):
+            await session.refresh(local, with_for_update=True)
+            if local.status == OrderStatus.pending_submit.value:  # re-check under lock
+                local.status = OrderStatus.failed.value
                 session.add(
                     EventLog(
                         source=EventSource.system.value,
-                        event_type="reconcile.missing_order",
+                        event_type="reconcile.never_submitted",
                         portfolio_id=portfolio_id,
                         order_id=local.id,
                         payload={
                             "client_order_id": local.client_order_id,
-                            "broker_order_id": local.broker_order_id,
                             "symbol": local.symbol,
-                            "local_status": local.status,
+                            "age_seconds": (now - local.created_at).total_seconds(),
                         },
                     )
                 )
                 log.warning(
-                    "reconcile.missing_order",
+                    "reconcile.never_submitted",
                     portfolio_id=str(portfolio_id),
                     client_order_id=local.client_order_id,
-                    local_status=local.status,
                 )
-                continue
-            if _apply_broker_order(local, true_state):
-                updated += 1
+                return 0
 
-        return updated, orphans, missing
+        session.add(
+            EventLog(
+                source=EventSource.system.value,
+                event_type="reconcile.missing_order",
+                portfolio_id=portfolio_id,
+                order_id=local.id,
+                payload={
+                    "client_order_id": local.client_order_id,
+                    "broker_order_id": local.broker_order_id,
+                    "symbol": local.symbol,
+                    "local_status": local.status,
+                },
+            )
+        )
+        log.warning(
+            "reconcile.missing_order",
+            portfolio_id=str(portfolio_id),
+            client_order_id=local.client_order_id,
+            local_status=local.status,
+        )
+        return 1

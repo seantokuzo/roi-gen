@@ -18,7 +18,7 @@ from app.models.enums import (
 from app.models.portfolio import BrokerCredential, Portfolio
 from app.models.strategy import Strategy
 from app.models.telemetry import EquitySnapshot, EventLog
-from app.models.trading import Fill, Lot, Order, Position
+from app.models.trading import Fill, Lot, LotClose, Order, Position
 from app.models.user import User
 
 __all__ = [
@@ -28,6 +28,7 @@ __all__ = [
     "EventSource",
     "Fill",
     "Lot",
+    "LotClose",
     "Order",
     "OrderClass",
     "OrderSide",

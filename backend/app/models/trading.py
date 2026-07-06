@@ -121,7 +121,7 @@ class Lot(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
 
     portfolio_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("portfolios.id"))
-    strategy_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("strategies.id"))
+    strategy_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("strategies.id"), index=True)
     symbol: Mapped[str] = mapped_column(String(16), index=True)
     side: Mapped[str] = mapped_column(String(32))
     qty_orig: Mapped[Decimal] = mapped_column(Numeric(18, 9))
@@ -131,3 +131,39 @@ class Lot(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     opened_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     realized_pnl: Mapped[Decimal] = mapped_column(Numeric(18, 6), default=Decimal("0"))
+
+
+class LotClose(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    """One FIFO consumption event: ``qty`` shares of ``lot_id`` closed at a P&L.
+
+    The per-close ledger exists because ``Lot.realized_pnl`` is an accumulator
+    with a single ``closed_at`` stamped only at FULL close — which makes the
+    realized loss on a partially-scaled-out lot invisible to same-day risk
+    queries, and attributes a multi-day lot's whole P&L to its final-close day.
+    Day-boundary risk math (the strategy daily-loss breaker) reads THIS table:
+    ``SUM(realized_pnl) WHERE closed_at >= <ET day start>``.
+
+    ``portfolio_id`` / ``strategy_id`` / ``symbol`` are denormalized from the
+    lot so the hot risk query needs no join. ``fill_id`` is the closing fill
+    (nullable — reconciliation-synthesized closes may predate any local fill row).
+    """
+
+    __tablename__ = "lot_closes"
+    __table_args__ = (
+        Index(
+            "ix_lot_closes_portfolio_strategy_closed_at",
+            "portfolio_id",
+            "strategy_id",
+            "closed_at",
+        ),
+    )
+
+    lot_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("lots.id"), index=True)
+    order_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("orders.id"))
+    fill_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("fills.id"))
+    portfolio_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("portfolios.id"))
+    strategy_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("strategies.id"))
+    symbol: Mapped[str] = mapped_column(String(16))
+    qty: Mapped[Decimal] = mapped_column(Numeric(18, 9))
+    realized_pnl: Mapped[Decimal] = mapped_column(Numeric(18, 6))
+    closed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))

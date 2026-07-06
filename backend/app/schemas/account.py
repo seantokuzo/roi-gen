@@ -135,6 +135,7 @@ class ReconcileResultOut(BaseModel):
     orders_updated: int
     orphans: int
     missing: int
+    fills_synthesized: int
     equity: Decimal
 
     @classmethod
@@ -147,5 +148,6 @@ class ReconcileResultOut(BaseModel):
             orders_updated=result.orders_updated,
             orphans=result.orphans,
             missing=result.missing,
+            fills_synthesized=result.fills_synthesized,
             equity=result.equity,
         )

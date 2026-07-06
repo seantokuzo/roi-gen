@@ -22,6 +22,7 @@ from decimal import Decimal
 from typing import TYPE_CHECKING
 
 from app.brokers.dto import OrderRequest
+from app.brokers.pricing import quantize_price
 from app.engine.risk import controls
 from app.engine.risk.approval import ControlCheck, RiskDecision, _mint_approval
 from app.models.enums import OrderClass, OrderType
@@ -51,6 +52,7 @@ class RiskEngine:
         checks: tuple[ControlCheck, ...] = (
             controls.check_account_tradeable(state),
             controls.check_entry_order_type(signal),
+            controls.check_time_in_force(signal),
             controls.check_extended_hours(signal),
             controls.check_session_open(state, limits),
             sizing.check,
@@ -100,8 +102,20 @@ class RiskEngine:
         optional. Only market/limit entries reach here (``check_entry_order_type``)
         and extended-hours signals are rejected (``check_extended_hours``), so
         every order built here is an RTH bracket with broker-side protection.
+
+        Prices are quantized to the sub-penny rule (≥$1 → 2dp, <$1 → 4dp) —
+        Alpaca rejects finer precision. Sizing already ran on the raw signal
+        prices; the sub-penny delta is noise relative to slippage and the sent
+        prices are what the audit trail records.
         """
-        limit_price = signal.entry_price if signal.order_type is OrderType.limit else None
+        limit_price = (
+            quantize_price(signal.entry_price) if signal.order_type is OrderType.limit else None
+        )
+        take_profit = (
+            quantize_price(signal.take_profit_price)
+            if signal.take_profit_price is not None
+            else None
+        )
         return OrderRequest(
             client_order_id=client_order_id,
             symbol=signal.symbol,
@@ -111,6 +125,6 @@ class RiskEngine:
             order_class=OrderClass.bracket,
             qty=qty,
             limit_price=limit_price,
-            stop_loss_stop_price=signal.stop_price,
-            take_profit_limit_price=signal.take_profit_price,
+            stop_loss_stop_price=quantize_price(signal.stop_price),
+            take_profit_limit_price=take_profit,
         )
