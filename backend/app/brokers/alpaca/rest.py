@@ -255,6 +255,15 @@ class AlpacaBrokerAdapter(BrokerAdapter):
             # it, so it was NOT placed — surface, never reconcile.
             raise OrderRejected(f"alpaca rejected order ({status}): {body}", status_code=status)
         if status >= 500:
+            if is_submit:
+                # A 5xx RESPONSE to a submit means the request reached the
+                # broker's edge — the order may or may not exist. Fate unknown:
+                # reconcile by client_order_id, never blind-resubmit.
+                raise AmbiguousOrderState(
+                    f"alpaca server error on submit ({status}); order state is "
+                    f"UNKNOWN — reconcile by client_order_id: {body}",
+                    status_code=status,
+                )
             raise BrokerUnavailable(f"alpaca server error ({status}): {body}", status_code=status)
         # Other 4xx on reads/cancels (404 handled by callers before here for the
         # "missing → None" cases; anything else is a genuine client error).

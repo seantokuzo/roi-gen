@@ -41,6 +41,10 @@ class Settings(BaseSettings):
     alpaca_secret_key: str = ""
     alpaca_data_feed: Literal["iex", "sip"] = "iex"
 
+    # ── Engine execution (Phase 2b; multi-portfolio orchestration is later) ──
+    engine_portfolio_id: str = ""  # portfolio the engine trades; empty = execution disabled
+    reconcile_interval_seconds: int = 300  # periodic broker reconcile (0 = boot-only)
+
     # ── LLM providers ────────────────────────────────────────────
     anthropic_api_key: str = ""
     gemini_api_key: str = ""

@@ -14,7 +14,7 @@ from app.models.enums import OrderClass, OrderSide, OrderType
 from tests.engine.builders import DEFAULT_NOW, make_limits, make_signal, make_state
 
 # Every evaluation records one ControlCheck per control — the full audit trail.
-_EXPECTED_CHECK_COUNT = 13
+_EXPECTED_CHECK_COUNT = 14
 
 
 def _engine() -> RiskEngine:

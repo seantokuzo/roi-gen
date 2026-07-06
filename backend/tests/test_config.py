@@ -25,6 +25,8 @@ def test_defaults_match_env_contract() -> None:
     assert settings.database_url == "postgresql+asyncpg://postgres:postgres@localhost:5432/roigen"
     assert settings.redis_url == "redis://localhost:6379/0"
     assert settings.alpaca_data_feed == "iex"
+    assert settings.engine_portfolio_id == ""  # execution disabled until set
+    assert settings.reconcile_interval_seconds == 300
     assert settings.llm_provider_fast == "anthropic"
     assert settings.llm_provider_smart == "anthropic"
     assert settings.llm_provider_premium == "anthropic"

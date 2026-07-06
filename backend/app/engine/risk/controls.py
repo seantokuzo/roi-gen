@@ -24,7 +24,7 @@ from decimal import ROUND_DOWN, Decimal
 from typing import TYPE_CHECKING
 
 from app.engine.risk.approval import ControlCheck
-from app.models.enums import OrderType
+from app.models.enums import OrderType, TimeInForce
 
 if TYPE_CHECKING:
     from app.core.config import Settings
@@ -197,6 +197,23 @@ def check_entry_order_type(signal: SignalEvent) -> ControlCheck:
         else f"{signal.order_type.value} entries are not supported "
         "(only market/limit; stop-triggered entries need a trigger price)",
         observed=signal.order_type.value,
+    )
+
+
+def check_time_in_force(signal: SignalEvent) -> ControlCheck:
+    """Day orders only. The platform is intraday: everything is flattened by
+    15:55 ET (Phase 2c), and the order-state machine treats ``done_for_day`` as
+    dormant on that assumption — a GTC order surviving into the next session
+    would break both. Multi-day lifecycles are a deliberate future decision,
+    not a default."""
+    ok = signal.time_in_force is TimeInForce.day
+    return ControlCheck(
+        "time_in_force",
+        passed=ok,
+        detail="day order"
+        if ok
+        else f"{signal.time_in_force.value} rejected — intraday platform, day TIF only",
+        observed=signal.time_in_force.value,
     )
 
 

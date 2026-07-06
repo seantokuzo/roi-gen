@@ -6,10 +6,13 @@ here in :class:`RiskStateProvider`, so the engine itself stays trivially unit
 testable and deterministic.
 
 Day boundaries for P&L and limits are the **ET calendar day** (iron law #5): we
-read the broker clock's instant, find its ET date, and filter closed lots from
-ET-midnight onward. P&L history comes from the ``lots`` table — the same
-``realized_pnl`` column legacy declared but never computed (the FIFO engine that
-populates it lands in Phase 2b; until then these queries correctly return zero).
+read the broker clock's instant, find its ET date, and filter from ET-midnight
+onward. Day realized P&L reads the ``lot_closes`` per-close ledger — NOT the
+``Lot.realized_pnl`` accumulator, whose ``closed_at`` is stamped only at full
+close and would hide a partially-scaled-out loss from the daily breaker (and
+attribute a multi-day lot's whole P&L to its final-close day). Consecutive
+losses stay lot-level: one fully-closed lot = one trade outcome, so a scale-out
+in three partials counts as one loss, not three.
 """
 
 from __future__ import annotations
@@ -25,7 +28,7 @@ from sqlalchemy import ColumnElement, func, select
 from app.models.enums import StrategyStatus
 from app.models.strategy import Strategy
 from app.models.telemetry import EquitySnapshot
-from app.models.trading import Lot
+from app.models.trading import Lot, LotClose
 
 if TYPE_CHECKING:
     import uuid
@@ -132,9 +135,9 @@ class RiskStateProvider:
 
         day_realized_strategy = await self._sum_realized(
             session,
-            Lot.portfolio_id == portfolio_id,
-            Lot.strategy_id == strategy_id,
-            Lot.closed_at >= et_start,
+            LotClose.portfolio_id == portfolio_id,
+            LotClose.strategy_id == strategy_id,
+            LotClose.closed_at >= et_start,
         )
         open_positions_count = await self._count_open_symbols(session, portfolio_id, strategy_id)
         consecutive_losses = await self._consecutive_losses(session, portfolio_id, strategy_id)
@@ -172,7 +175,7 @@ class RiskStateProvider:
 
     @staticmethod
     async def _sum_realized(session: AsyncSession, *conditions: ColumnElement[bool]) -> Decimal:
-        stmt = select(func.coalesce(func.sum(Lot.realized_pnl), 0)).where(*conditions)
+        stmt = select(func.coalesce(func.sum(LotClose.realized_pnl), 0)).where(*conditions)
         # coalesce(..., 0) makes this non-null at runtime; the guard is for mypy,
         # which types Result.scalar() as Optional regardless.
         total: Decimal | None = (await session.execute(stmt)).scalar()
