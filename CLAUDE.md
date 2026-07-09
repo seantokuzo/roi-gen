@@ -26,11 +26,14 @@ Single-user (Sean) autonomous intraday trading platform on Alpaca. Paper + live,
 - **Engine patterns**: FIFO event bus (asyncio.Queue), MarketEvent→SignalEvent→OrderEvent→FillEvent, Strategy-as-class (`on_bar`/`on_quote`/`on_trade_update`), ExecutionHandler interface (AlpacaLive | SimulatedFill — same Strategy code in backtest and live), `client_order_id` persisted before submission, boot reconciliation against broker, never resubmit on ambiguous timeout.
 - **Testing**: every engine/risk change needs tests; the simulator is the test harness. CI must be green before merge (global rule).
 
-## PR Review Tiers (this project)
+## PR Review (this project — LOCAL ONLY)
 
-- Sticky marker: `<!-- ROIGEN-VERDICT-STICKY -->` (round-completion signal per global workflow).
-- Tier 1: `@claude` mentions for Q&A. Tier 2: auto review on every PR (`.github/workflows/claude-code-review.yml`). Tier 3 (deep): auto-escalated for changes touching `backend/app/engine/risk*`, `backend/app/engine/execution*`, `backend/app/services/broker*`, `.github/workflows/**` — these are the money-losing surfaces.
-- Merge style: `--merge` (global default). Max 4 rounds then human-decides.
+Cloud auto-review is **disabled** (Sean's direction, 2026-07-09; workflow file deleted). The global CLAUDE.md cloud loop — sticky-marker polling, `@claude` mentions, GitHub App rounds — does NOT apply here. Its local equivalents replace it:
+
+- **Design review** (before implementation, money surfaces only): 3–5 parallel adversarial subagent lenses fitting the change (e.g. risk, execution/order-state, concurrency, broker-reality, data-integrity). Confirmed findings fold into the design before code is written.
+- **Code review** (every PR, pre-push): multi-lens adversarial local review of the branch diff; every finding verified (confirmed/refuted), never assumed. **Deep tier** for diffs touching `backend/app/engine/risk*`, `backend/app/engine/execution*`, `backend/app/services/broker*`, `.github/workflows/**`: don't review the diff in isolation — trace signal→risk→execution→broker end to end. Iron-law violations are always blocking.
+- **Judge**: after fixes, an impartial judge subagent (fresh context, no review history) decides merge / another round / human-decides. Max 4 rounds then human-decides.
+- **Merge gate**: CI green (GitHub CI still runs on PRs) + judge says merge → `gh pr merge --merge --delete-branch`. Post-merge handoff per global workflow (sync main, update `docs/STATE.md`, QA offer, next move).
 
 ## Domain Gotchas (from legacy forensics + research)
 
