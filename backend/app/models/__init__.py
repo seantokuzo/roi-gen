@@ -5,7 +5,9 @@ required by Alembic autogenerate (``alembic/env.py`` imports this module).
 """
 
 from app.models.base import TimestampMixin, UUIDPrimaryKeyMixin
+from app.models.engine_command import EngineCommand, KillState, derive_kill_state
 from app.models.enums import (
+    EngineCommandAction,
     EventSource,
     OrderClass,
     OrderSide,
@@ -23,10 +25,13 @@ from app.models.user import User
 
 __all__ = [
     "BrokerCredential",
+    "EngineCommand",
+    "EngineCommandAction",
     "EquitySnapshot",
     "EventLog",
     "EventSource",
     "Fill",
+    "KillState",
     "Lot",
     "LotClose",
     "Order",
@@ -43,4 +48,5 @@ __all__ = [
     "TimestampMixin",
     "User",
     "UUIDPrimaryKeyMixin",
+    "derive_kill_state",
 ]

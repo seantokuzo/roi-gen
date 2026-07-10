@@ -6,15 +6,18 @@ from decimal import Decimal
 
 import pytest
 from sqlalchemy import delete, select
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import (
     BrokerCredential,
+    EngineCommand,
+    EngineCommandAction,
     EquitySnapshot,
     EventLog,
     EventSource,
     Fill,
+    KillState,
     Lot,
     Order,
     OrderClass,
@@ -28,6 +31,7 @@ from app.models import (
     StrategyStatus,
     TimeInForce,
     User,
+    derive_kill_state,
 )
 from tests.conftest import TEST_EMAIL
 
@@ -367,6 +371,112 @@ async def test_lot_quantity_bounds_enforced(
     with pytest.raises(IntegrityError):
         await db_session.flush()
     await db_session.rollback()
+
+
+# ── Engine command log ───────────────────────────────────────────
+
+
+def _make_command(**overrides: object) -> EngineCommand:
+    fields: dict[str, object] = {
+        "action": EngineCommandAction.halt,
+        "reason": "unit test",
+        "actor": "cli:test",
+    }
+    fields.update(overrides)
+    return EngineCommand(**fields)
+
+
+async def test_engine_command_round_trip(db_session: AsyncSession) -> None:
+    command = _make_command(action=EngineCommandAction.flatten, reason="drawdown breach")
+    db_session.add(command)
+    await db_session.commit()
+    await db_session.refresh(command)
+
+    row = (
+        await db_session.execute(select(EngineCommand).where(EngineCommand.id == command.id))
+    ).scalar_one()
+    assert row.action == EngineCommandAction.flatten
+    assert row.scope == "global"
+    assert row.reason == "drawdown breach"
+    assert row.actor == "cli:test"
+    assert isinstance(row.seq, int)  # DB-assigned identity
+    assert row.issued_at.tzinfo is not None  # server-defaulted timestamptz
+    assert row.applied_at is None  # not yet picked up by the sweep
+    assert row.result is None  # outcome written on verified completion only
+
+
+async def test_engine_command_seq_monotonic_across_inserts(db_session: AsyncSession) -> None:
+    seqs: list[int] = []
+    actions = (EngineCommandAction.halt, EngineCommandAction.flatten, EngineCommandAction.resume)
+    for action in actions:
+        command = _make_command(action=action)
+        db_session.add(command)
+        await db_session.commit()
+        await db_session.refresh(command)
+        seqs.append(command.seq)
+
+    assert seqs == sorted(seqs)
+    assert len(set(seqs)) == 3  # strictly increasing — no ties
+
+    # Latest-state query shape: the newest command decides the kill-state.
+    latest = (
+        await db_session.execute(select(EngineCommand).order_by(EngineCommand.seq.desc()).limit(1))
+    ).scalar_one()
+    assert latest.action == EngineCommandAction.resume
+
+
+async def test_engine_command_seq_is_db_assigned(db_session: AsyncSession) -> None:
+    # GENERATED ALWAYS: a writer-supplied seq is rejected by the DB — writer
+    # clocks/values must never order kill-switch state.
+    db_session.add(_make_command(seq=999))
+    with pytest.raises(DBAPIError):
+        await db_session.flush()
+    await db_session.rollback()
+
+
+async def test_engine_command_sweep_query_returns_unapplied_only(
+    db_session: AsyncSession,
+) -> None:
+    commands = [
+        _make_command(action=EngineCommandAction.halt),
+        _make_command(action=EngineCommandAction.flatten),
+        _make_command(action=EngineCommandAction.resume),
+    ]
+    for command in commands:
+        db_session.add(command)
+        await db_session.commit()
+    # The engine sweep stamped the first command already.
+    commands[0].applied_at = datetime(2026, 7, 9, 14, 0, 0, tzinfo=UTC)
+    await db_session.commit()
+
+    # Sweep query shape (served by the partial index on seq WHERE applied_at IS NULL).
+    unapplied = (
+        (
+            await db_session.execute(
+                select(EngineCommand)
+                .where(EngineCommand.applied_at.is_(None))
+                .order_by(EngineCommand.seq)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert [c.id for c in unapplied] == [commands[1].id, commands[2].id]
+
+
+@pytest.mark.parametrize(
+    ("latest_action", "expected"),
+    [
+        (None, KillState(halted=False, flattening=False)),  # empty log → armed
+        (EngineCommandAction.halt, KillState(halted=True, flattening=False)),
+        (EngineCommandAction.flatten, KillState(halted=True, flattening=True)),
+        (EngineCommandAction.resume, KillState(halted=False, flattening=False)),
+        # Unknown action fails closed: halt entries, never flatten on garbage.
+        ("garbage", KillState(halted=True, flattening=False)),
+    ],
+)
+def test_derive_kill_state(latest_action: str | None, expected: KillState) -> None:
+    assert derive_kill_state(latest_action) == expected
 
 
 # ── Cascade ──────────────────────────────────────────────────────

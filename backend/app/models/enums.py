@@ -99,3 +99,11 @@ class EventSource(StrEnum):
     engine = "engine"
     broker = "broker"
     system = "system"
+
+
+class EngineCommandAction(StrEnum):
+    """Operator kill-switch commands (engine_commands.action)."""
+
+    halt = "halt"
+    flatten = "flatten"
+    resume = "resume"
