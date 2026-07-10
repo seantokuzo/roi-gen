@@ -309,4 +309,4 @@ async def _run_scenario(
     assert all(c.strategy_id is not None for c in closes), (
         "flatten closes lost strategy attribution — the day breaker would be blind"
     )
-    assert position is not None and position.qty == 0
+    assert position is None or position.qty == 0  # tracker deletes the row at flat
