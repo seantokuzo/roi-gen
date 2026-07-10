@@ -418,7 +418,15 @@ class ExecutionStage:
         # prior drive — canceling those would restart their fill clock every
         # re-drive and prevent the flatten from ever completing. Account-wide by
         # policy: the engine's account is engine-only (manual orders get swept).
-        open_orders = await self._adapter.list_orders(status="open")
+        #
+        # nested=False (review-critical): the protective legs of a FILLED bracket
+        # parent must appear as their own top-level cancelable orders. Under the
+        # default nested rollup a filled parent's legs can be invisible to this
+        # query, so the sweep would leave them working, the liquidation would hit
+        # held-qty (the legs reserve the shares) on EVERY re-drive, and the
+        # flatten would livelock while the position rides on its own legs. The
+        # flat listing surfaces each leg; canceling either OCO leg kills the pair.
+        open_orders = await self._adapter.list_orders(status="open", nested=False)
         requests += 1
         covered_symbols = {
             o.symbol
@@ -430,23 +438,49 @@ class ExecutionStage:
             for o in open_orders
             if not (o.client_order_id or "").startswith(_FLATTEN_CLIENT_ID_PREFIX)
         ]
+        # Per-item isolation (review finding): one flaky cancel — a transient
+        # BrokerUnavailable or an unclassifiable OrderRefused — must NOT abort
+        # the whole pass and skip liquidating every other symbol. Log and press
+        # on; an uncanceled leg simply makes its symbol's liquidation hit
+        # held-qty, which the controller re-drives.
+        pending: set[str] = set()
         for order in to_cancel:
-            await self._adapter.cancel_order(order.broker_order_id)  # idempotent
             requests += 1
+            try:
+                await self._adapter.cancel_order(order.broker_order_id)  # idempotent
+                pending.add(order.broker_order_id)
+            except Exception as exc:  # noqa: BLE001 — isolate; the rest must still cancel + close
+                log.warning(
+                    "engine.execution.flatten_cancel_failed",
+                    flatten_id=str(approval.flatten_id),
+                    broker_order_id=order.broker_order_id,
+                    symbol=order.symbol,
+                    error=repr(exc),
+                )
 
         # 2. Confirm cancels settled: Alpaca cancels are async, and a liquidation
         # submitted while a leg still reserves the qty is refused. ANY terminal
         # state settles it — `filled` means the leg won the race, which the fresh
         # position read below simply absorbs. Unsettled leftovers are not fatal:
         # their symbol's liquidation gets refused and the controller re-drives.
-        pending = {o.broker_order_id for o in to_cancel}
+        # Each poll is isolated too — a flaky get_order leaves that order
+        # unsettled, never aborts the confirmation of the others.
         for delay in self._cancel_confirm_delays:
             if not pending:
                 break
             await asyncio.sleep(delay)
             for broker_order_id in list(pending):
-                found = await self._adapter.get_order(broker_order_id)
                 requests += 1
+                try:
+                    found = await self._adapter.get_order(broker_order_id)
+                except Exception as exc:  # noqa: BLE001 — treat as unsettled; keep polling the rest
+                    log.warning(
+                        "engine.execution.flatten_confirm_failed",
+                        flatten_id=str(approval.flatten_id),
+                        broker_order_id=broker_order_id,
+                        error=repr(exc),
+                    )
+                    continue
                 if found is None or found.status in _CANCEL_SETTLED_STATUSES:
                     pending.discard(broker_order_id)
         if pending:
@@ -559,12 +593,18 @@ class ExecutionStage:
         try:
             broker_order = await self._adapter.submit_order(req)
         except OrderRejected as exc:
+            # retryable_held_qty distinguishes a transient cancel-race refusal
+            # (a leg still reserves the shares — clears once cancels settle,
+            # and the flatten controller re-drives) from a real rejection. It
+            # lands in the audit row so a stuck flatten is diagnosable from the
+            # ledger, not just a symptom.
             await self._mark_terminal(
                 session,
                 identity,
                 status=OrderStatus.rejected,
                 event_type="order.rejected_by_broker",
                 error=str(exc),
+                extra={"retryable_held_qty": exc.retryable_held_qty},
             )
             return
         except BrokerRateLimited as exc:
@@ -697,12 +737,20 @@ class ExecutionStage:
         status: OrderStatus,
         event_type: str,
         error: str,
+        extra: dict[str, Any] | None = None,
     ) -> None:
         locked = await lock_order_by_client_id(session, identity.client_order_id)
         if locked is None:  # pragma: no cover — we just committed it
             msg = f"order row vanished for {identity.client_order_id}"
             raise RuntimeError(msg)
         locked.status = status.value
+        payload: dict[str, Any] = {
+            "client_order_id": locked.client_order_id,
+            "status": status.value,
+            "error": error,
+        }
+        if extra:
+            payload.update(extra)
         session.add(
             EventLog(
                 source=EventSource.engine.value,
@@ -710,11 +758,7 @@ class ExecutionStage:
                 portfolio_id=identity.portfolio_id,
                 strategy_id=identity.strategy_id,
                 order_id=locked.id,
-                payload={
-                    "client_order_id": locked.client_order_id,
-                    "status": status.value,
-                    "error": error,
-                },
+                payload=payload,
             )
         )
         await session.commit()

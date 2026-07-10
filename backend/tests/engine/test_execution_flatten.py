@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, cast
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
-from app.brokers.errors import AmbiguousOrderState, OrderRejected
+from app.brokers.errors import AmbiguousOrderState, BrokerUnavailable, OrderRejected
 from app.engine.bus import EventBus
 from app.engine.events import FlattenOrderEvent, OrderEvent
 from app.engine.execution.handler import ExecutionStage
@@ -64,6 +64,8 @@ class _FlattenAdapter(FakeEngineAdapter):
         positions: Sequence[BrokerPosition] = (),
         get_order_results: dict[str, BrokerOrder] | None = None,
         submit_errors: dict[str, Exception] | None = None,
+        cancel_errors: dict[str, Exception] | None = None,
+        get_order_errors: dict[str, Exception] | None = None,
         lookup_results: Sequence[BrokerOrder | None] = (),
         lookup_error: Exception | None = None,
     ) -> None:
@@ -73,10 +75,13 @@ class _FlattenAdapter(FakeEngineAdapter):
         self.positions = list(positions)
         self.get_order_results = dict(get_order_results or {})
         self.submit_errors = dict(submit_errors or {})  # keyed by symbol
+        self.cancel_errors = dict(cancel_errors or {})  # keyed by broker_order_id
+        self.get_order_errors = dict(get_order_errors or {})  # keyed by broker_order_id
         self.lookup_results = list(lookup_results)
         self.lookup_error = lookup_error
         self.calls: list[tuple[str, str]] = []
         self.canceled: list[str] = []
+        self.list_orders_nested: list[bool] = []
         self.submitted: list[OrderRequest] = []
         self.lookups: list[str] = []
         self.row_status_at_submit: dict[str, str | None] = {}
@@ -93,6 +98,7 @@ class _FlattenAdapter(FakeEngineAdapter):
         nested: bool = True,
     ) -> list[BrokerOrder]:
         self.calls.append(("list_orders", status))
+        self.list_orders_nested.append(nested)
         if self.list_orders_started is not None:
             self.list_orders_started.set()
         if self.list_orders_release is not None:
@@ -101,10 +107,16 @@ class _FlattenAdapter(FakeEngineAdapter):
 
     async def cancel_order(self, broker_order_id: str) -> None:
         self.calls.append(("cancel_order", broker_order_id))
+        error = self.cancel_errors.get(broker_order_id)
+        if error is not None:
+            raise error
         self.canceled.append(broker_order_id)
 
     async def get_order(self, broker_order_id: str) -> BrokerOrder | None:
         self.calls.append(("get_order", broker_order_id))
+        error = self.get_order_errors.get(broker_order_id)
+        if error is not None:
+            raise error
         return self.get_order_results.get(broker_order_id)
 
     async def list_positions(self) -> list[BrokerPosition]:
@@ -634,3 +646,95 @@ async def test_racing_flattens_coalesce_into_a_single_drive(
     assert len(executed) == 1
     assert executed[0].payload["flatten_id"] == str(first.flatten_id)
     assert len(adapter.submitted) == 1  # exactly one drive liquidated
+
+
+# ── Round-2 review fixes: robustness of the cancel/confirm/enumerate steps ──
+
+
+async def test_cancel_set_is_enumerated_un_nested(
+    db_engine: AsyncEngine, db_session: AsyncSession, seeded_user: User
+) -> None:
+    # The protective legs of a FILLED bracket parent must appear as top-level
+    # cancelable orders (nested=False), or the sweep leaves them working and the
+    # liquidation livelocks on held-qty.
+    portfolio = await _seeded_portfolio(db_session, seeded_user)
+    _event, approval = mint_flatten_approval(portfolio.id)
+    adapter = _FlattenAdapter(db_engine, positions=[make_broker_position("AAPL", qty=Decimal("4"))])
+    stage = _stage(db_engine, adapter)
+    await _drive(stage, approval)
+
+    assert adapter.list_orders_nested  # it was called
+    assert all(nested is False for nested in adapter.list_orders_nested)
+
+
+async def test_a_flaky_cancel_does_not_abort_the_pass(
+    db_engine: AsyncEngine, db_session: AsyncSession, seeded_user: User
+) -> None:
+    # One cancel raising a transient error (not 404/422 — those the adapter
+    # swallows) must be isolated: the other order still cancels and every
+    # position still liquidates.
+    portfolio = await _seeded_portfolio(db_session, seeded_user)
+    _event, approval = mint_flatten_approval(portfolio.id)
+    leg_a = make_broker_order(broker_order_id="bo-leg-a", client_order_id="alpaca-leg-a")
+    leg_b = make_broker_order(broker_order_id="bo-leg-b", client_order_id="alpaca-leg-b")
+    adapter = _FlattenAdapter(
+        db_engine,
+        open_orders=[leg_a, leg_b],
+        positions=[make_broker_position("AAPL", qty=Decimal("7"))],
+        cancel_errors={"bo-leg-a": BrokerUnavailable("503 during cancel")},
+        get_order_results={
+            "bo-leg-b": make_broker_order(broker_order_id="bo-leg-b", status=OrderStatus.canceled)
+        },
+    )
+    stage = _stage(db_engine, adapter)
+    await _drive(stage, approval)
+
+    assert adapter.canceled == ["bo-leg-b"]  # leg-a raised, leg-b still canceled
+    failed = await get_events(db_engine, "flatten.cancel_failed")
+    # the warning is a log, not an EventLog — assert the observable outcome:
+    assert failed == []
+    assert [r.symbol for r in adapter.submitted] == ["AAPL"]  # reached step 3 anyway
+    executed = await get_events(db_engine, "flatten.executed")
+    assert len(executed) == 1
+
+
+async def test_a_flaky_confirm_poll_does_not_abort_the_pass(
+    db_engine: AsyncEngine, db_session: AsyncSession, seeded_user: User
+) -> None:
+    portfolio = await _seeded_portfolio(db_session, seeded_user)
+    _event, approval = mint_flatten_approval(portfolio.id)
+    leg = make_broker_order(broker_order_id="bo-leg", client_order_id="alpaca-leg")
+    adapter = _FlattenAdapter(
+        db_engine,
+        open_orders=[leg],
+        positions=[make_broker_position("AAPL", qty=Decimal("2"))],
+        get_order_errors={"bo-leg": BrokerUnavailable("503 during confirm")},
+    )
+    stage = _stage(db_engine, adapter)
+    await _drive(stage, approval)
+
+    # The confirm poll errored for the leg, but the pass still liquidated.
+    assert [r.symbol for r in adapter.submitted] == ["AAPL"]
+
+
+async def test_held_qty_rejection_flag_lands_in_the_audit_row(
+    db_engine: AsyncEngine, db_session: AsyncSession, seeded_user: User
+) -> None:
+    # A cancel-race held-qty refusal is distinguishable from a real rejection
+    # in the ledger, so a stuck flatten is diagnosable (review finding: the
+    # discriminator was write-only).
+    portfolio = await _seeded_portfolio(db_session, seeded_user)
+    _event, approval = mint_flatten_approval(portfolio.id)
+    adapter = _FlattenAdapter(
+        db_engine,
+        positions=[make_broker_position("AAPL", qty=Decimal("5"))],
+        submit_errors={
+            "AAPL": OrderRejected("insufficient qty available", retryable_held_qty=True)
+        },
+    )
+    stage = _stage(db_engine, adapter)
+    await _drive(stage, approval)
+
+    rejected = await get_events(db_engine, "order.rejected_by_broker")
+    assert len(rejected) == 1
+    assert rejected[0].payload["retryable_held_qty"] is True

@@ -371,7 +371,11 @@ class FlattenController:
 
     async def _exposure(self) -> _Exposure:
         positions = await self._adapter.list_positions()
-        open_orders = await self._adapter.list_orders(status="open")
+        # nested=False for the same reason the flatten cancel-sweep uses it: a
+        # filled bracket parent's protective legs must count as working orders
+        # (keep driving until they're canceled) instead of hiding under a
+        # rolled-up parent and letting `fully_covered` read true prematurely.
+        open_orders = await self._adapter.list_orders(status="open", nested=False)
         working = 0
         covered: set[str] = set()
         for order in open_orders:
@@ -392,11 +396,22 @@ class FlattenController:
         return (await self._exposure()).exposed
 
     async def _count_pending_submit(self) -> int:
+        """Local pending_submit orders that may be live but broker-invisible.
+
+        Excludes our OWN flatten liquidations (review finding): a liquidation is
+        position-REDUCING, so an ambiguous one stuck in pending_submit (until
+        reconcile ages it, up to ~7 min) is not exposure to flatten — counting
+        it would withhold ``flat_verified`` and refuse ``resume`` against a
+        broker-flat book. If such a liquidation never actually landed, its
+        target position is still open and independently counted from broker
+        truth; the liquidation row itself must not double as exposure.
+        """
         async with self._session_factory() as session:
             rows = await session.execute(
                 select(Order.id).where(
                     Order.portfolio_id == self._portfolio_id,
                     Order.status.in_(_PENDING_LOCAL_STATUSES),
+                    ~Order.client_order_id.startswith(FLATTEN_CLIENT_ID_PREFIX),
                 )
             )
             return len(rows.scalars().all())

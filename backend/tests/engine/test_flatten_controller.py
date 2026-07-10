@@ -368,6 +368,34 @@ async def test_pending_submit_rows_count_as_exposure(
     assert [e.source for e in rig.events] == ["scheduled_close"]
 
 
+async def test_own_pending_liquidation_is_not_counted_as_exposure(
+    db_engine: AsyncEngine, db_session: AsyncSession, seeded_user: User
+) -> None:
+    # A flatten's OWN liquidation stuck in pending_submit (ambiguous submit) is
+    # position-REDUCING; counting it would withhold flat_verified and refuse
+    # resume against a broker-flat book (review finding).
+    portfolio = await seed_portfolio(db_session, seeded_user.id)
+    await seed_order(
+        db_session,
+        portfolio.id,
+        None,
+        client_order_id="roigen-flatten-deadbeefcafe-aapl",
+        status=OrderStatus.pending_submit,
+        symbol="AAPL",
+    )
+    await db_session.commit()
+
+    adapter = _ControllerAdapter(
+        clock=make_clock(now=EDT_CLOSE - timedelta(minutes=4), is_open=True),
+        calendar=[_edt_day()],
+    )
+    rig = _rig(db_engine, adapter, portfolio_id=portfolio.id)
+    rig.controller._next_open_snapshot = (EDT_DATE, False)
+
+    await rig.tick()  # broker flat + only a flatten pending row → nothing to drive
+    assert rig.events == []
+
+
 # ── Kill-switch flattens ─────────────────────────────────────────────
 
 
