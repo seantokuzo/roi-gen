@@ -87,6 +87,19 @@ class Settings(BaseSettings):
             self.secret_key = _DEV_SECRET_KEY
         return self
 
+    @model_validator(mode="after")
+    def _require_sane_flatten_buffer(self) -> Self:
+        # A zero/negative buffer puts flatten_at at-or-after the close: the
+        # controller's "while session open" guard could then never pass and the
+        # mandatory flatten would silently never fire, while the entry-side
+        # cutoff (check_session_open) simultaneously collapses to the bell.
+        # 2 minutes is the floor that survives worst-case cancel-confirm (~2s)
+        # + liquidation submit latency with margin.
+        if self.flatten_buffer_minutes < 2:
+            msg = "FLATTEN_BUFFER_MINUTES must be >= 2 (the mandatory close flatten needs room)"
+            raise ValueError(msg)
+        return self
+
 
 @lru_cache
 def get_settings() -> Settings:

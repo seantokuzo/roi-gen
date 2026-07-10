@@ -24,13 +24,23 @@ from typing import TYPE_CHECKING
 from app.brokers.dto import OrderRequest
 from app.brokers.pricing import quantize_price
 from app.engine.risk import controls
-from app.engine.risk.approval import ControlCheck, RiskDecision, _mint_approval
+from app.engine.risk.approval import (
+    ControlCheck,
+    FlattenDecision,
+    RiskDecision,
+    _mint_approval,
+    _mint_flatten_approval,
+)
 from app.models.enums import OrderClass, OrderType
 
 if TYPE_CHECKING:
-    from app.engine.events import SignalEvent
+    from app.engine.events import FlattenEvent, SignalEvent
     from app.engine.risk.controls import RiskLimits
     from app.engine.risk.state import RiskState
+
+# Provenance tags a FlattenEvent may carry; anything else is a wiring bug and
+# is refused so the audit trail can never contain an unexplained flatten.
+_FLATTEN_SOURCES = frozenset({"kill_switch", "scheduled_close", "next_open"})
 
 # Greppable client_order_id prefix — persisted before submission and the
 # reconciliation key on an ambiguous timeout (never blind-resubmit).
@@ -91,6 +101,47 @@ class RiskEngine:
             checks=checks,
         )
         return RiskDecision(checks=checks, approval=approval, order_request=order_request)
+
+    def authorize_flatten(self, event: FlattenEvent) -> FlattenDecision:
+        """Authorize driving a portfolio flat; the only minter of ``FlattenApproval``.
+
+        Deliberately pure on the event alone — no ``RiskState``, no broker or DB
+        reads. Flatten is the safety action: it must authorize while entries are
+        halted, while the feed is stale, while the account is entry-blocked, and
+        while the broker's account endpoint is erroring. The checks below are
+        wiring validation (scope + provenance), recorded for the audit trail;
+        they are not market gates and must never become ones.
+        """
+        checks: tuple[ControlCheck, ...] = (
+            ControlCheck(
+                name="flatten_scope",
+                passed=event.portfolio_id.int != 0,
+                detail="portfolio-scoped flatten",
+                observed=str(event.portfolio_id),
+            ),
+            ControlCheck(
+                name="flatten_provenance",
+                passed=event.source in _FLATTEN_SOURCES and bool(event.reason),
+                detail="known source with a stated reason",
+                limit="|".join(sorted(_FLATTEN_SOURCES)),
+                observed=f"{event.source}: {event.reason or '<no reason>'}",
+            ),
+        )
+        failed = [c for c in checks if not c.passed]
+        if failed:
+            reason = "; ".join(f"{c.name}: {c.observed}" for c in failed)
+            return FlattenDecision(checks=checks, reason=reason)
+
+        approval = _mint_flatten_approval(
+            flatten_id=event.flatten_id,
+            portfolio_id=event.portfolio_id,
+            reason=event.reason,
+            source=event.source,
+            command_seq=event.command_seq,
+            approved_at=datetime.now(UTC),
+            checks=checks,
+        )
+        return FlattenDecision(checks=checks, approval=approval)
 
     @staticmethod
     def _build_order_request(

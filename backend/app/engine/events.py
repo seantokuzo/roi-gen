@@ -28,7 +28,7 @@ from app.models.enums import OrderSide, OrderType, TimeInForce
 
 if TYPE_CHECKING:
     from app.brokers.dto import Bar, OrderRequest, Quote, Trade
-    from app.engine.risk.approval import RiskApproval
+    from app.engine.risk.approval import FlattenApproval, RiskApproval
 
 
 def _now_utc() -> datetime:
@@ -137,6 +137,47 @@ class OrderEvent(Event):
     @property
     def side(self) -> OrderSide:
         return self.order_request.side
+
+
+# ── Flatten (Phase 2c): drive a portfolio flat via risk → execution ──
+
+
+@dataclass(frozen=True, slots=True)
+class FlattenEvent(Event):
+    """The FlattenController's intent to drive one portfolio flat.
+
+    Published ONLY by the FlattenController (kill-switch state, the 15:55
+    window, and the next-open catch-up are its inputs, not sibling publishers) —
+    flatten is level-triggered from durable state, so a lost event costs one
+    re-drive tick, never the intent. Routed through the RiskStage like every
+    other order-producing path (iron law #1): risk audits the decision and
+    mints the :class:`~app.engine.risk.approval.FlattenApproval` the execution
+    handler demands.
+
+    ``source`` is the provenance tag (``kill_switch`` / ``scheduled_close`` /
+    ``next_open``); ``command_seq`` links kill-switch flattens back to their
+    ``engine_commands`` row for the audit chain.
+    """
+
+    portfolio_id: uuid.UUID
+    reason: str
+    source: str
+    command_seq: int | None = None
+    flatten_id: uuid.UUID = field(default_factory=uuid.uuid4)
+    created_at: datetime = field(default_factory=_now_utc)
+
+
+@dataclass(frozen=True, slots=True)
+class FlattenOrderEvent(Event):
+    """A risk-authorized flatten, ready for the execution handler.
+
+    The approval is the directive: mint-guarded, pair-bound to one
+    ``flatten_id``. The execution handler enumerates what to cancel/close from
+    broker truth at execution time (the lagging local ``Position`` table never
+    decides action), so no symbol list travels here.
+    """
+
+    approval: FlattenApproval
 
 
 # ── Execution output → strategy input ────────────────────────────────
