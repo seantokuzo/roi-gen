@@ -232,6 +232,31 @@ async def test_status_flattening_with_heartbeat_task_health(
     assert body["engine_tasks"] == {"event_bus": True, "flatten_controller": False}
 
 
+async def test_status_flattening_false_after_flat_verified(
+    auth_client: httpx.AsyncClient, fake_redis: FakeRedis, db_session: AsyncSession
+) -> None:
+    """Once the controller writes flat_verified, /engine/status must report the
+    drive as done — halted-only — not "flattening" forever (result-aware
+    derivation, shared with the engine's own KillSwitch)."""
+    flatten = await auth_client.post(
+        f"{API}/commands", json={"action": "flatten", "reason": "get me out"}
+    )
+    assert flatten.status_code == 201
+    row = await db_session.scalar(
+        select(EngineCommand).where(EngineCommand.seq == flatten.json()["seq"])
+    )
+    assert row is not None
+    row.result = RESULT_FLAT_VERIFIED
+    await db_session.commit()
+
+    resp = await auth_client.get(f"{API}/status")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["halted"] is True
+    assert body["flattening"] is False
+    assert body["latest_command"]["result"] == RESULT_FLAT_VERIFIED
+
+
 # ── Auth gate ────────────────────────────────────────────────────────
 
 

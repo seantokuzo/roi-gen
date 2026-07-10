@@ -27,9 +27,12 @@ runway before the mandatory close-window flatten.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
+import signal
 import subprocess
 import sys
+import tempfile
 import uuid
 from datetime import timedelta
 from pathlib import Path
@@ -81,28 +84,43 @@ async def _poll(check: Any, timeout: float, interval: float = 2.0, *, what: str)
 
 
 class _EngineProc:
-    """The real engine as a child process, torn down hard on exit."""
+    """The real engine as a child process, torn down hard on exit.
+
+    Logs go to a TEMP FILE, never a PIPE: an undrained 64KB pipe fills under
+    DEBUG logging within a minute and the child's blocking stdout write would
+    freeze the entire engine mid-test (review finding). ``start_new_session``
+    + process-group kill means a SIGKILL'd pytest cannot orphan a live trading
+    process against the paper account.
+    """
 
     def __init__(self, env: dict[str, str]) -> None:
         backend_dir = Path(__file__).resolve().parents[2]
+        self._log = tempfile.NamedTemporaryFile(  # noqa: SIM115 — lifetime spans the test
+            mode="w+b", prefix="roigen-e2e-engine-", suffix=".log", delete=False
+        )
         self._proc = subprocess.Popen(  # noqa: S603 — our own module, our own env
             [sys.executable, "-m", "app.engine_main"],
             cwd=backend_dir,
             env=env,
-            stdout=subprocess.PIPE,
+            stdout=self._log,
             stderr=subprocess.STDOUT,
+            start_new_session=True,
         )
 
     def stop(self) -> str:
         if self._proc.poll() is None:
-            self._proc.terminate()
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(os.getpgid(self._proc.pid), signal.SIGTERM)
             try:
                 self._proc.wait(timeout=15)
             except subprocess.TimeoutExpired:
-                self._proc.kill()
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(os.getpgid(self._proc.pid), signal.SIGKILL)
                 self._proc.wait(timeout=5)
-        out = self._proc.stdout.read().decode(errors="replace") if self._proc.stdout else ""
-        return out
+        self._log.flush()
+        out = Path(self._log.name).read_bytes().decode(errors="replace")
+        self._log.close()
+        return f"{out}\n(engine log file kept at {self._log.name})"
 
     @property
     def alive(self) -> bool:
@@ -227,6 +245,9 @@ async def _run_scenario(
                     Order.portfolio_id == portfolio_id,
                     Order.symbol == _SYMBOL,
                     Order.strategy_id.is_not(None),
+                    # Bracket LEGS inherit strategy_id; without this the poll
+                    # can latch onto a never-filling stop leg (review finding).
+                    Order.parent_order_id.is_(None),
                 )
             )
             if order is None or order.status != "filled":
@@ -262,6 +283,20 @@ async def _run_scenario(
 
     cmd = await _poll(_flatten_verified, _FLATTEN_TIMEOUT, what="flatten flat_verified")
     assert cmd.applied_at is not None
+
+    # flat_verified reads broker truth; the local row's fill lands via the
+    # stream writer and can trail by a beat — poll it briefly before asserting.
+    async def _liq_filled() -> bool:
+        async with factory() as session:
+            status = await session.scalar(
+                select(Order.status).where(
+                    Order.portfolio_id == portfolio_id,
+                    Order.client_order_id.startswith("roigen-flatten"),
+                )
+            )
+            return status == "filled"
+
+    await _poll(_liq_filled, 60.0, what="liquidation order filled locally")
 
     # ── Broker truth: flat, and nothing working.
     assert await adapter.get_position(_SYMBOL) is None

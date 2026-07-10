@@ -146,6 +146,11 @@ async def _acquire_engine_lock(portfolio_id: uuid.UUID) -> AsyncConnection | Non
     if not got:
         await conn.close()
         return None
+    # Session-level advisory locks survive transaction end; rolling back here
+    # keeps the pinned connection out of idle-in-transaction, where a managed
+    # server's idle_in_transaction_session_timeout would silently kill the
+    # session — and with it the singleton guarantee (review finding).
+    await conn.rollback()
     return conn
 
 
@@ -234,6 +239,7 @@ class _TradingStack:
     bus: EventBus
     tu_consumer: AlpacaTradeUpdatesConsumer
     subscriber: RedisTradeUpdateSubscriber
+    execution: ExecutionStage
     kill_switch: KillSwitch
     feed_health: FeedHealth
     controller: FlattenController
@@ -349,6 +355,7 @@ def _build_trading(settings: Settings, redis: aioredis.Redis) -> _TradingStack |
         bus=bus,
         tu_consumer=tu_consumer,
         subscriber=subscriber,
+        execution=execution_stage,
         kill_switch=kill_switch,
         feed_health=feed_health,
         controller=controller,
@@ -617,6 +624,11 @@ async def main() -> None:
             with _suppress_cleanup_errors():
                 await consumer.stop()
         if trading is not None:
+            # Give an in-flight flatten a bounded chance to finish BEFORE the
+            # adapter closes under it — abandoning one is recoverable but must
+            # be loud, not an incidental cancellation.
+            with _suppress_cleanup_errors():
+                await trading.execution.drain_flattens()
             with _suppress_cleanup_errors():
                 await trading.tu_consumer.stop()
         for task in tasks:

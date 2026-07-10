@@ -33,6 +33,7 @@ from app.models import (
     User,
     derive_kill_state,
 )
+from app.models.engine_command import RESULT_FLAT_VERIFIED
 from tests.conftest import TEST_EMAIL
 
 
@@ -465,18 +466,33 @@ async def test_engine_command_sweep_query_returns_unapplied_only(
 
 
 @pytest.mark.parametrize(
-    ("latest_action", "expected"),
+    ("latest_action", "latest_result", "expected"),
     [
-        (None, KillState(halted=False, flattening=False)),  # empty log → armed
-        (EngineCommandAction.halt, KillState(halted=True, flattening=False)),
-        (EngineCommandAction.flatten, KillState(halted=True, flattening=True)),
-        (EngineCommandAction.resume, KillState(halted=False, flattening=False)),
+        (None, None, KillState(halted=False, flattening=False)),  # empty log → armed
+        (EngineCommandAction.halt, None, KillState(halted=True, flattening=False)),
+        (EngineCommandAction.flatten, None, KillState(halted=True, flattening=True)),
+        # A broker-verified flatten is DONE flattening: halted-only until resume
+        # (a result-blind derivation reported "flattening" forever — review).
+        (
+            EngineCommandAction.flatten,
+            RESULT_FLAT_VERIFIED,
+            KillState(halted=True, flattening=False),
+        ),
+        # Any non-verified outcome keeps the drive owed.
+        (
+            EngineCommandAction.flatten,
+            "failed: broker 503 during liquidation",
+            KillState(halted=True, flattening=True),
+        ),
+        (EngineCommandAction.resume, None, KillState(halted=False, flattening=False)),
         # Unknown action fails closed: halt entries, never flatten on garbage.
-        ("garbage", KillState(halted=True, flattening=False)),
+        ("garbage", None, KillState(halted=True, flattening=False)),
     ],
 )
-def test_derive_kill_state(latest_action: str | None, expected: KillState) -> None:
-    assert derive_kill_state(latest_action) == expected
+def test_derive_kill_state(
+    latest_action: str | None, latest_result: str | None, expected: KillState
+) -> None:
+    assert derive_kill_state(latest_action, latest_result) == expected
 
 
 # ── Cascade ──────────────────────────────────────────────────────

@@ -1,9 +1,9 @@
-"""ProbeStrategy — ET-day dedup, param parsing, and the DB-derived session bound."""
+"""ProbeStrategy — RTH filter, ET-day dedup, params, and the DB session bound."""
 
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 
@@ -28,11 +28,11 @@ if TYPE_CHECKING:
 
     from app.models.user import User
 
-# DEFAULT_NOW is 2026-06-26 15:00 UTC = 11:00 ET (EDT). The same ET trading
-# date runs until 2026-06-27 03:59:59 UTC — a 20:05 ET extended-hours bar is
-# already on the NEXT UTC date.
-LATE_SAME_ET_DAY = datetime(2026, 6, 27, 0, 5, tzinfo=UTC)  # 20:05 ET 06-26
-NEXT_ET_DAY = DEFAULT_NOW + timedelta(days=1)
+# DEFAULT_NOW is FRIDAY 2026-06-26 15:00 UTC = 11:00 ET (EDT), mid-RTH. The
+# probe drops non-RTH bars outright (weekends, pre/post market), so "the next
+# ET trading day" is MONDAY 06-29 at the same wall clock — +1 day would be a
+# Saturday bar the RTH filter (correctly) swallows.
+NEXT_ET_DAY = DEFAULT_NOW + timedelta(days=3)  # Monday 2026-06-29, 11:00 ET
 
 
 def _probe(
@@ -128,20 +128,49 @@ async def test_probe_next_et_day_emits_again() -> None:
     assert len(signals) == 2
 
 
-async def test_probe_dedup_key_is_et_date_not_utc() -> None:
-    """A 20:05 ET extended-hours bar is next-day UTC but the SAME ET session."""
+async def test_probe_dedup_key_is_the_et_calendar_date() -> None:
+    """The dedup key is the ET trading DATE, not a rolling window: a Monday
+    late-afternoon bar and Tuesday's open bar are <18h apart yet distinct
+    sessions — an elapsed-time key would swallow the second entry. The
+    day-state's stored key is pinned to the ET date directly (a UTC-date key
+    is what the RTH filter now makes unreachable to distinguish by behavior:
+    inside RTH the two calendars always agree)."""
     bus = EventBus()
     signals = _capture(bus)
     probe = _probe(bus)
 
-    await probe.on_bar(make_bar("SPY"))
-    await probe.on_bar(make_bar("SPY", ts=LATE_SAME_ET_DAY))  # must NOT re-enter
-    await bus.drain()
-    assert len(signals) == 1
+    monday_afternoon = datetime(2026, 6, 29, 19, 50, tzinfo=UTC)  # 15:50 ET Mon
+    tuesday_open = datetime(2026, 6, 30, 13, 31, tzinfo=UTC)  # 09:31 ET Tue
 
-    await probe.on_bar(make_bar("SPY", ts=NEXT_ET_DAY))  # control: real new day
+    await probe.on_bar(make_bar("SPY", ts=monday_afternoon))
+    await probe.on_bar(make_bar("SPY", ts=monday_afternoon + timedelta(minutes=5)))
+    await bus.drain()
+    assert len(signals) == 1  # same ET date: one entry, however many bars
+    assert probe._day_state["SPY"].et_date == date(2026, 6, 29)
+
+    await probe.on_bar(make_bar("SPY", ts=tuesday_open))  # new ET date, <18h later
     await bus.drain()
     assert len(signals) == 2
+    assert probe._day_state["SPY"].et_date == date(2026, 6, 30)
+
+
+async def test_probe_non_rth_bar_emits_nothing_and_keeps_the_entry_slot() -> None:
+    """IEX prints extended-hours bars: a pre-market bar must be dropped BEFORE
+    day-state exists — emitting would be risk-rejected, and counting it would
+    burn the day's only entry slot (review finding)."""
+    bus = EventBus()
+    signals = _capture(bus)
+    probe = _probe(bus)
+
+    premarket = datetime(2026, 6, 26, 12, 0, tzinfo=UTC)  # 08:00 ET Friday
+    await probe.on_bar(make_bar("SPY", ts=premarket))
+    await bus.drain()
+    assert signals == []
+    assert probe._day_state == {}  # the slot was not consumed
+
+    await probe.on_bar(make_bar("SPY", ts=DEFAULT_NOW))  # 11:00 ET, same ET date
+    await bus.drain()
+    assert len(signals) == 1  # the RTH bar still gets the day's entry
 
 
 async def test_probe_tracks_days_per_symbol() -> None:

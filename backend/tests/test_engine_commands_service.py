@@ -175,18 +175,23 @@ async def test_resume_allowed_after_flat_verified(db_session: AsyncSession) -> N
     assert resume.seq > flatten.seq
 
 
-async def test_resume_allowed_when_halt_follows_flatten(db_session: AsyncSession) -> None:
-    """flatten → halt → resume: the LATEST command is what the guard reads.
+async def test_resume_refused_when_halt_sandwiches_unresolved_flatten(
+    db_session: AsyncSession,
+) -> None:
+    """flatten → halt → resume is REFUSED while the flatten has no outcome.
 
-    This is the sequence the engine itself produces (the sweep marks the
-    older flatten superseded); the guard must allow resume even before the
-    sweep has stamped it, because latest=halt already means "not flattening".
+    Review finding: latest-row-only reading made this two-step a casual bypass
+    of the resume guard — and with the engine DOWN (when the CLI matters most)
+    nothing has superseded the flatten while its protective-leg cancels may
+    already be live at the broker. Once the engine sweep stamps the flatten
+    ``superseded`` (or the controller verifies flat), resume flows — the
+    with-stamp test below covers that path.
     """
     redis = FakeRedis()
     await _issue(db_session, redis, EngineCommandAction.flatten)
     await _issue(db_session, redis, EngineCommandAction.halt)
-    resume = await _issue(db_session, redis, EngineCommandAction.resume)
-    assert resume.action == "resume"
+    with pytest.raises(ResumeRefusedError):
+        await _issue(db_session, redis, EngineCommandAction.resume)
 
 
 async def test_resume_allowed_after_superseded_flatten_with_sweep_stamp(
@@ -255,6 +260,20 @@ async def test_read_status_halt_state(db_session: AsyncSession) -> None:
     status = await read_status(db_session, redis, portfolio_id=None)
     assert status.halted is True
     assert status.flattening is False
+
+
+async def test_read_status_not_flattening_after_flat_verified(db_session: AsyncSession) -> None:
+    """The status derivation is result-aware: a broker-verified flatten reports
+    halted-only (a result-blind reader said "flattening" forever — review)."""
+    redis = FakeRedis()
+    flatten = await _issue(db_session, redis, EngineCommandAction.flatten)
+    await _mark_result(db_session, flatten, RESULT_FLAT_VERIFIED)
+
+    status = await read_status(db_session, redis, portfolio_id=None)
+    assert status.halted is True  # still halted until an explicit resume
+    assert status.flattening is False  # the drive is done
+    assert status.latest_command is not None
+    assert status.latest_command.result == RESULT_FLAT_VERIFIED
 
 
 async def test_read_status_unparseable_heartbeat_is_alive_without_detail(

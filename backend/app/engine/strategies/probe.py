@@ -62,6 +62,15 @@ DEFAULT_TAKE_PROFIT_PCT = Decimal("0.01")
 DEFAULT_MAX_ENTRIES_PER_SESSION = 1
 
 _ONE = Decimal("1")
+
+
+def _in_rth(ts: datetime) -> bool:
+    """True iff ``ts`` falls inside regular trading hours by ET wall clock."""
+    et = ts.astimezone(ET)
+    minutes = et.hour * 60 + et.minute
+    return et.weekday() < 5 and (9 * 60 + 30) <= minutes < 16 * 60
+
+
 _ABSENT = object()
 
 
@@ -136,6 +145,12 @@ class ProbeStrategy(Strategy):
 
     async def on_bar(self, bar: Bar) -> None:
         if bar.symbol not in self.symbols:
+            return
+        if not _in_rth(bar.timestamp):
+            # IEX prints extended-hours bars; a pre-market signal would be
+            # risk-rejected AND burn the day's only entry slot (review
+            # finding). Wall-clock RTH is an approximation (no calendar here);
+            # half-day early closes are covered by risk's session gate.
             return
 
         et_date = bar.timestamp.astimezone(ET).date()

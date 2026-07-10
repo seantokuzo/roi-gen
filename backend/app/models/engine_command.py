@@ -56,6 +56,14 @@ class EngineCommand(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     result: Mapped[str | None] = mapped_column(Text)
 
 
+# Command-row ``result`` vocabulary. ``flat_verified`` is the only completion
+# an operator may trust (written by the FlattenController after a broker-truth
+# flat check); ``superseded`` means a newer command voided the row. Defined
+# with the model so every derivation of kill-state shares one source.
+RESULT_FLAT_VERIFIED = "flat_verified"
+RESULT_SUPERSEDED = "superseded"
+
+
 class KillState(NamedTuple):
     """Kill-switch state derived from the latest :class:`EngineCommand`."""
 
@@ -63,18 +71,21 @@ class KillState(NamedTuple):
     flattening: bool
 
 
-def derive_kill_state(latest_action: str | None) -> KillState:
-    """Map the latest command's ``action`` (``None`` = empty log) to kill-state.
+def derive_kill_state(latest_action: str | None, latest_result: str | None = None) -> KillState:
+    """Map the latest command's ``action`` + ``result`` to kill-state.
 
-    ``halt`` → halted; ``flatten`` → halted + flattening; ``resume`` or an
-    empty log → armed. An UNRECOGNIZED action fails closed to halted (block
-    new entries) but never flattening — flatten mutates broker state and must
-    not fire on a garbage row.
+    ``halt`` → halted; ``flatten`` → halted + flattening — UNLESS its result
+    is already ``flat_verified``, in which case the drive is done and the
+    state is halted-only. The engine-side and API/CLI-side derivations MUST
+    agree here (review finding: a result-blind reader reported "flattening"
+    forever after verification). ``resume`` or an empty log → armed. An
+    UNRECOGNIZED action fails closed to halted (block new entries) but never
+    flattening — flatten mutates broker state and must not fire on garbage.
     """
     if latest_action is None or latest_action == EngineCommandAction.resume:
         return KillState(halted=False, flattening=False)
     if latest_action == EngineCommandAction.halt:
         return KillState(halted=True, flattening=False)
     if latest_action == EngineCommandAction.flatten:
-        return KillState(halted=True, flattening=True)
+        return KillState(halted=True, flattening=latest_result != RESULT_FLAT_VERIFIED)
     return KillState(halted=True, flattening=False)

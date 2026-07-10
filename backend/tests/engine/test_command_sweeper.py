@@ -106,7 +106,7 @@ async def test_applied_at_is_stamped_once_and_never_restamped(
     assert (await get_command_row(db_engine, halt.seq)).applied_at == first
 
 
-async def test_new_flatten_pokes_the_controller_exactly_once(
+async def test_flatten_pokes_the_controller_on_every_sweep_while_flattening(
     db_engine: AsyncEngine, db_session: AsyncSession
 ) -> None:
     flatten = await seed_command(db_session, EngineCommandAction.flatten)
@@ -120,9 +120,48 @@ async def test_new_flatten_pokes_the_controller_exactly_once(
     assert ks.flatten_command_seq == flatten.seq
     assert rec.pokes == 1
 
-    # Same state, nothing new: the timer sweep must not re-poke every 5s.
+    # Level-triggered, not edge-triggered: while a flatten is owed, EVERY sweep
+    # re-pokes — a poke consumed mid-controller-tick must never be the last one
+    # ever (lost-wakeup review finding). A spurious wake is a cheap broker-truth
+    # no-op; a lost intent is an unprotected book.
     await sweeper.sweep()
-    assert rec.pokes == 1
+    await sweeper.sweep()
+    assert rec.pokes == 3
+
+    # Resume ends the drive: the timer sweeps go quiet again.
+    await seed_command(db_session, EngineCommandAction.resume)
+    await db_session.commit()
+    await sweeper.sweep()
+    await sweeper.sweep()
+    assert ks.is_flattening is False
+    assert rec.pokes == 3
+
+
+async def test_stamp_applied_never_stamps_rows_newer_than_the_swept_latest(
+    db_engine: AsyncEngine, db_session: AsyncSession
+) -> None:
+    """A command committed between the latest-read and the stamp query must not
+    get pickup stamped by a sweep that applied an OLDER state — ``applied_at``
+    means "this state was picked up", and the next timer sweep collects the
+    newer row within 5s anyway (audit fidelity)."""
+    older = await seed_command(db_session, EngineCommandAction.halt)
+    newer = await seed_command(db_session, EngineCommandAction.resume)
+    await db_session.commit()
+
+    sweeper, _ks, _rec = _sweeper(db_engine)
+    factory = async_sessionmaker(db_engine, expire_on_commit=False)
+    async with factory() as session:
+        # Simulate the race directly: this "sweep" read `older` as its latest,
+        # while `newer` was already committed by another writer.
+        latest_was_new = await sweeper._stamp_applied(session, older.seq)
+        await session.commit()
+
+    assert latest_was_new is True
+    assert (await get_command_row(db_engine, older.seq)).applied_at is not None
+    assert (await get_command_row(db_engine, newer.seq)).applied_at is None  # not this sweep's
+
+    await sweeper.sweep()  # the next real sweep applies + stamps the newer row
+    assert (await get_command_row(db_engine, newer.seq)).applied_at is not None
 
 
 async def test_boot_sweep_repokes_an_already_applied_flatten(

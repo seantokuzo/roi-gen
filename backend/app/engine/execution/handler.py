@@ -164,6 +164,27 @@ class ExecutionStage:
         self._bus.subscribe(OrderEvent, self._on_order)
         self._bus.subscribe(FlattenOrderEvent, self._on_flatten)
 
+    async def drain_flattens(self, timeout: float = 10.0) -> None:
+        """Shutdown hook: give in-flight flatten tasks a bounded chance to finish.
+
+        A flatten abandoned mid-drive is RECOVERABLE (persist-before-submit +
+        the controller's level trigger re-drive at next boot), but silently
+        killing one leaves legs-canceled-liquidation-unsubmitted with no row
+        saying so — loud is mandatory when no restart may be coming.
+        """
+        pending = set(self._flatten_tasks)
+        if not pending:
+            return
+        _done, still_pending = await asyncio.wait(pending, timeout=timeout)
+        for task in still_pending:
+            log.critical(
+                "engine.execution.flatten_abandoned_at_shutdown",
+                task=task.get_name(),
+                detail="in-flight flatten did not finish before shutdown; "
+                "boot reconcile + the flatten controller re-drive will recover",
+            )
+            task.cancel()
+
     # ── The one order path ───────────────────────────────────────────
 
     async def _on_order(self, event: OrderEvent) -> None:
@@ -327,6 +348,12 @@ class ExecutionStage:
             )
             return
         self._seen_flatten_ids.add(approval.flatten_id)
+        if len(self._seen_flatten_ids) > 512:
+            # Bound the replay guard (a stuck flatten re-drives every 30s for
+            # hours). Ancient replays after a clear are still harmless: the
+            # single-flight lock coalesces, and a fresh drive against broker
+            # truth is idempotent.
+            self._seen_flatten_ids = {approval.flatten_id}
         task = asyncio.create_task(self._run_flatten(approval))
         self._flatten_tasks.add(task)
         task.add_done_callback(self._flatten_tasks.discard)
@@ -393,6 +420,11 @@ class ExecutionStage:
         # policy: the engine's account is engine-only (manual orders get swept).
         open_orders = await self._adapter.list_orders(status="open")
         requests += 1
+        covered_symbols = {
+            o.symbol
+            for o in open_orders
+            if (o.client_order_id or "").startswith(_FLATTEN_CLIENT_ID_PREFIX)
+        }
         to_cancel = [
             o
             for o in open_orders
@@ -431,6 +463,18 @@ class ExecutionStage:
         outcomes: list[_SymbolOutcome] = []
         for position in positions:
             if position.qty == 0:
+                continue
+            if position.symbol in covered_symbols:
+                # A prior drive's liquidation is still working this symbol —
+                # re-submitting would just mint a held-qty rejection per
+                # re-drive tick until it fills (review finding).
+                outcomes.append(
+                    _SymbolOutcome(
+                        symbol=position.symbol,
+                        outcome="submitted",
+                        detail="covered by a working liquidation from a prior drive",
+                    )
+                )
                 continue
             outcome = await self._liquidate_symbol(approval, position.symbol, position.qty)
             outcomes.append(outcome)

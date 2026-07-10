@@ -121,6 +121,15 @@ async def apply_fill_to_lots(
     ]
     if strategy_id is not None:
         conditions.append(Lot.strategy_id == strategy_id)
+    else:
+        # Time bound (review-critical): a liquidation can only close exposure
+        # that existed when it PRINTED. Without this, the reconcile retry pass
+        # replaying a parked remainder days later would consume freshly-opened
+        # unrelated lots — a phantom LotClose feeding the wrong strategy's
+        # same-day breaker, then a phantom short when the real exit arrives.
+        # A remainder that never finds a time-eligible lot stays parked and
+        # alerting, which is honest; consuming the future is corruption.
+        conditions.append(Lot.opened_at <= occurred_at)
     # FOR UPDATE: the Order-row locks writers hold only serialize fills of the
     # SAME order — two writers filling DIFFERENT orders in this same
     # (portfolio, strategy, symbol) scope (live writer vs periodic-reconcile

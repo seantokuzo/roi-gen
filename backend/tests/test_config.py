@@ -80,5 +80,17 @@ def test_alpaca_data_feed_rejects_unknown_value() -> None:
         Settings(_env_file=None, alpaca_data_feed="bloomberg")  # type: ignore[arg-type]
 
 
+@pytest.mark.parametrize("minutes", [0, 1])
+def test_flatten_buffer_below_two_minutes_is_rejected(minutes: int) -> None:
+    # A sub-2-minute buffer puts flatten_at inside worst-case cancel-confirm +
+    # submit latency; 0 collapses the mandatory close flatten entirely.
+    with pytest.raises(ValidationError, match="FLATTEN_BUFFER_MINUTES"):
+        Settings(_env_file=None, flatten_buffer_minutes=minutes)
+
+
+def test_flatten_buffer_floor_of_two_minutes_is_accepted() -> None:
+    assert Settings(_env_file=None, flatten_buffer_minutes=2).flatten_buffer_minutes == 2
+
+
 def test_get_settings_is_cached_singleton() -> None:
     assert get_settings() is get_settings()

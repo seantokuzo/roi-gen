@@ -678,6 +678,12 @@ async def test_interleaved_entry_after_liquidation_heals_end_to_end(
         filled_qty=Decimal("100"),
     )
     entry.filled_avg_price = Decimal("100")
+    # The entry PRINTED before the liquidation that closed it (entries always
+    # do — a liquidation can only close exposure that existed when it printed).
+    # The synthesized lot inherits this instant as opened_at, which is what
+    # makes it time-eligible for the parked remainder's `opened_at <=
+    # occurred_at` bound.
+    entry.filled_at = _PARKED_AT - timedelta(minutes=30)
     await db_session.commit()
 
     result = await ReconciliationService().reconcile_portfolio(
@@ -705,3 +711,45 @@ async def test_interleaved_entry_after_liquidation_heals_end_to_end(
     assert Decimal(resolved[0].payload["applied_qty"]) == Decimal("100")
     assert resolved[0].payload["residual_qty"] == "0"
     assert await _events(db_session, "lots.unapplied_remainder_retry_failed") == []
+
+
+async def test_parked_remainder_never_consumes_lots_opened_after_the_liquidation(
+    db_session: AsyncSession, portfolio: Portfolio, seeded_user: User
+) -> None:
+    """Review-critical time bound: a parked liquidation remainder may only heal
+    against exposure that existed when the liquidation PRINTED. A lot opened
+    AFTER its occurred_at (a later, unrelated entry in the same symbol) must
+    stay untouched — consuming it would mint a phantom LotClose into the wrong
+    strategy's same-day breaker and a phantom short when the real exit lands.
+    The remainder stays parked and still escalates on schedule."""
+    strategy = await seed_strategy(db_session, portfolio.id)
+    await _park_remainder(db_session, portfolio, qty="50")
+    await seed_lot(
+        db_session,
+        portfolio.id,
+        strategy.id,
+        qty_orig=Decimal("50"),
+        qty_open=Decimal("50"),
+        entry_price=Decimal("100"),
+        opened_at=_PARKED_AT + timedelta(hours=1),  # AFTER the liquidation printed
+    )
+    await db_session.commit()
+
+    service = ReconciliationService()
+    for cycle in range(1, 4):
+        await service.reconcile_portfolio(
+            db_session, portfolio.id, RecordingAdapter(), synthesize_fills=True
+        )
+        await db_session.commit()
+        failed = await _events(db_session, "lots.unapplied_remainder_retry_failed")
+        assert len(failed) == cycle  # parked, honestly, every cycle
+
+    lot = (await db_session.execute(select(Lot))).scalars().one()
+    assert lot.qty_open == Decimal("50")  # the future was never consumed
+    assert lot.realized_pnl == Decimal("0")
+    assert (await db_session.execute(select(LotClose))).scalars().all() == []
+    assert await _events(db_session, "lots.unapplied_remainder_resolved") == []
+    alerts = await _events(db_session, "lots.unapplied_remainder_alert")
+    assert len(alerts) == 1  # the 3-cycle escalation still fires
+    assert alerts[0].payload["cycles"] == 3
+    assert Decimal(alerts[0].payload["qty"]) == Decimal("50")

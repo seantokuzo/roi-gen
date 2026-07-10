@@ -19,18 +19,19 @@ from typing import TYPE_CHECKING
 from sqlalchemy import select
 
 from app.core.logging import get_logger
-from app.models.engine_command import EngineCommand
-from app.models.enums import EngineCommandAction
+from app.models.engine_command import (
+    RESULT_FLAT_VERIFIED,
+    RESULT_SUPERSEDED,
+    EngineCommand,
+    derive_kill_state,
+)
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 log = get_logger("engine.kill_switch")
 
-# Command-row results the controller/sweeper write. `flat_verified` is the only
-# completion the operator may trust; everything else means "still owed".
-RESULT_FLAT_VERIFIED = "flat_verified"
-RESULT_SUPERSEDED = "superseded"
+__all__ = ["RESULT_FLAT_VERIFIED", "RESULT_SUPERSEDED", "KillSwitch"]
 
 
 class KillSwitch:
@@ -73,25 +74,23 @@ class KillSwitch:
         )
 
     def apply_latest(self, latest: EngineCommand | None) -> None:
-        """Derive state from the latest command (sweeper calls this per sweep)."""
+        """Derive state from the latest command (sweeper calls this per sweep).
+
+        Delegates to the model's :func:`derive_kill_state` — the SAME function
+        the API/CLI status reader uses, so the two operator surfaces cannot
+        drift from the engine's own view (review finding).
+        """
         if latest is None:
             self._halted = False
             self._flattening = False
             self._reason = None
             self._latest_seq = None
             return
-        action = EngineCommandAction(latest.action)
+        state = derive_kill_state(latest.action, latest.result)
         self._latest_seq = latest.seq
         self._reason = latest.reason
-        if action is EngineCommandAction.resume:
-            self._halted = False
-            self._flattening = False
-        else:
-            self._halted = True
-            # A verified flatten stays halted but no longer needs driving.
-            self._flattening = (
-                action is EngineCommandAction.flatten and latest.result != RESULT_FLAT_VERIFIED
-            )
+        self._halted = state.halted
+        self._flattening = state.flattening
 
     async def mark_flatten_verified(self, command_seq: int | None) -> bool:
         """Record broker-verified flatness on the driving command row.

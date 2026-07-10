@@ -81,6 +81,10 @@ _TICK_NEAR = 120.0
 _TICK_FAR = 900.0
 _NEAR_THRESHOLD = timedelta(minutes=30)
 
+# Let the opening auction print before a next-open remediation fires market
+# liquidations into it.
+_OPEN_GRACE = timedelta(seconds=15)
+
 
 @dataclass(frozen=True, slots=True)
 class _Session:
@@ -151,7 +155,11 @@ class FlattenController:
         self._wake = asyncio.Event()
         self._calendar_cache: dict[date, _Session | None] = {}
         self._post_close_checked: set[date] = set()
-        self._next_open_snapshot: bool | None = None
+        # Pre-open exposure observation, keyed to ITS trading date: a process
+        # suspension can wake straight from one session into the next, and a
+        # stale scalar would replay yesterday's verdict against today's book
+        # (review finding, three lenses independently).
+        self._next_open_snapshot: tuple[date, bool] | None = None
         self._next_open_fired: set[date] = set()
 
     def poke(self) -> None:
@@ -163,6 +171,11 @@ class FlattenController:
         await self._boot_reconciled.wait()
         log.info("engine.flatten.controller_started", portfolio_id=str(self._portfolio_id))
         while not shutdown.is_set():
+            # Clear BEFORE the tick, not before the sleep: a poke that lands
+            # while _tick is mid-broker-I/O must survive into the wait below,
+            # or a kill-flatten issued during a long pre-window tick would sit
+            # out the full sleep chunk (review finding: lost-wakeup).
+            self._wake.clear()
             try:
                 sleep_for = await self._tick()
             except Exception:  # noqa: BLE001 — the safety loop must survive anything
@@ -187,17 +200,28 @@ class FlattenController:
         if session is None:
             return self._sleep_toward(now, clock.next_open)
 
+        # The calendar was cached (possibly just after midnight); the LIVE
+        # clock's next_close wins when it is earlier — an intraday early-close
+        # amendment must pull the flatten forward, never let market orders be
+        # scheduled into a closed market (folded design-review finding).
+        rth_close = session.rth_close
+        if clock.is_open and clock.next_close is not None:
+            rth_close = min(rth_close, clock.next_close)
+        flatten_at = rth_close - self._flatten_buffer
+
         if now < session.rth_open:
             # Pre-open: snapshot whether exposure predates the session, so the
             # open-tick knows leftovers from legitimate same-session entries.
-            self._next_open_snapshot = await self._has_any_exposure()
+            self._next_open_snapshot = (session.trading_date, await self._has_any_exposure())
             return self._sleep_toward(now, session.rth_open)
 
-        if now < session.flatten_at:
-            await self._maybe_next_open_flatten(session, now)
-            return self._sleep_toward(now, session.flatten_at)
+        if now < flatten_at:
+            driving = await self._maybe_next_open_flatten(session, now, clock)
+            if driving:
+                return _TICK_IN_WINDOW
+            return self._sleep_toward(now, flatten_at)
 
-        if now < session.rth_close:
+        if now < rth_close and clock.is_open:
             # WATCH WINDOW — unconditional every session, whether or not any
             # flatten was requested: this is the 15:55 rule itself.
             await self._drive(source="scheduled_close", reason="mandatory close-window flatten")
@@ -247,32 +271,42 @@ class FlattenController:
         )
         return True
 
-    async def _maybe_next_open_flatten(self, session: _Session, now: datetime) -> None:
+    async def _maybe_next_open_flatten(
+        self, session: _Session, now: datetime, clock: MarketClock
+    ) -> bool:
         """Flatten exposure that predates the session, right after the open.
 
         Bracket legs are day-TIF: anything that survived last close has no stop
-        working NOW. Fired once per session, only for pre-existing exposure —
-        identified by the pre-open snapshot when we watched the open happen, or
-        by lot evidence (min ``Lot.opened_at`` before today's open; NO lot
-        evidence at all is treated as stale — fail toward flat) when we booted
-        mid-session.
+        working NOW. Stale exposure is identified by the pre-open snapshot for
+        THIS trading date when we watched the open happen, or by lot evidence
+        (min ``Lot.opened_at`` before today's open; NO lot evidence at all is
+        treated as stale — fail toward flat) otherwise. LEVEL-TRIGGERED like
+        every other flatten source (review finding): the date is marked done
+        only once the stale exposure is confirmed gone — a transient error at
+        the open re-drives on the next tick instead of silently waiting for
+        15:55. Returns True while actively driving (caller keeps fast cadence).
         """
         if session.trading_date in self._next_open_fired:
-            return
+            return False
+        if not clock.is_open or now < session.rth_open + _OPEN_GRACE:
+            # Let the opening auction print before firing market liquidations.
+            return False
         exposure = await self._exposure()
         if not exposure.exposed:
             self._next_open_fired.add(session.trading_date)
-            return
-        if self._next_open_snapshot is None:
-            # Booted mid-session: no pre-open observation; consult lot evidence.
+            return False
+        snapshot = self._next_open_snapshot
+        if snapshot is not None and snapshot[0] == session.trading_date:
+            stale = snapshot[1]
+        else:
+            # No same-date pre-open observation (mid-session boot, or a
+            # suspension slept through the open): consult lot evidence.
             stale = await self._exposure_predates(session.rth_open, exposure.position_symbols)
-            if not stale:
-                self._next_open_fired.add(session.trading_date)
-                return
-        elif not self._next_open_snapshot:
+        if not stale:
             self._next_open_fired.add(session.trading_date)
-            return
-        self._next_open_fired.add(session.trading_date)
+            return False
+        if exposure.fully_covered:
+            return True  # drive in flight — re-check next tick, don't re-fire
         log.warning(
             "engine.flatten.next_open_remediation",
             trading_date=str(session.trading_date),
@@ -284,6 +318,7 @@ class FlattenController:
             command_seq=None,
             exposure=exposure,
         )
+        return True
 
     async def _drive(self, *, source: str, reason: str) -> None:
         """One re-drive tick: fire iff exposed and not already fully covered."""
@@ -296,14 +331,28 @@ class FlattenController:
         """The one mandatory after-the-bell truth check — the alarm's single owner."""
         if session.trading_date in self._post_close_checked:
             return
+        exposure = await self._exposure()
+        # Only a SUCCESSFUL broker-truth read counts as checked: a broker error
+        # at 16:00 is correlated with whatever broke the flatten, and it must
+        # not permanently silence the one overnight-exposure alarm (review
+        # finding). The tick-level catch retries us on the next wake.
         self._post_close_checked.add(session.trading_date)
-        # Keep the per-date sets from growing unbounded across long uptimes.
+        # Keep the per-date structures from growing unbounded across long uptimes.
         if len(self._post_close_checked) > 30:
             cutoff = sorted(self._post_close_checked)[-30]
             self._post_close_checked = {d for d in self._post_close_checked if d >= cutoff}
             self._next_open_fired = {d for d in self._next_open_fired if d >= cutoff}
-        exposure = await self._exposure()
+            self._calendar_cache = {d: s for d, s in self._calendar_cache.items() if d >= cutoff}
         if not exposure.exposed:
+            # The session's verified-flat terminal row: scheduled/next-open
+            # flattens get a completion record too, not just kill-switch ones.
+            await self._audit(
+                "flatten.session_flat",
+                payload={
+                    "trading_date": str(session.trading_date),
+                    "verified_at": datetime.now(UTC).isoformat(),
+                },
+            )
             log.info("engine.flatten.post_close_flat", trading_date=str(session.trading_date))
             return
         payload: dict[str, object] = {
@@ -410,8 +459,11 @@ class FlattenController:
         return min(_TICK_NEAR, max(remaining / 2, 1.0))
 
     async def _sleep(self, shutdown: asyncio.Event, seconds: float) -> None:
-        """Sleep until timeout, shutdown, or a poke — whichever first."""
-        self._wake.clear()
+        """Sleep until timeout, shutdown, or a poke — whichever first.
+
+        The wake event is cleared by ``run()`` BEFORE each tick (never here):
+        a poke landing mid-tick must cut this sleep short.
+        """
         shutdown_task = asyncio.create_task(shutdown.wait())
         wake_task = asyncio.create_task(self._wake.wait())
         try:

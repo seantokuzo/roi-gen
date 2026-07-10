@@ -147,7 +147,6 @@ class EngineCommandSweeper:
             if latest is None:
                 self._kill_switch.apply_latest(None)
                 return
-            was_flattening = self._kill_switch.is_flattening
             newly_seen = await self._stamp_applied(session, latest.seq)
             await self._supersede_stale_flattens(session, latest)
             await session.commit()
@@ -162,15 +161,24 @@ class EngineCommandSweeper:
                 actor=latest.actor,
                 reason=latest.reason,
             )
-        if self._kill_switch.is_flattening and (newly_seen or not was_flattening):
+        if self._kill_switch.is_flattening:
+            # Poke on EVERY sweep while a flatten is owed, not just on edges: a
+            # poke consumed mid-controller-tick would otherwise be the last one
+            # ever (review finding: lost-wakeup). A spurious wake is a cheap
+            # broker-truth no-op.
             self._controller.poke()
 
     async def _stamp_applied(self, session: AsyncSession, latest_seq: int) -> bool:
-        """Record pickup on every not-yet-seen row; True if the latest was among them."""
+        """Record pickup on every not-yet-seen row up to the one this sweep applied.
+
+        Bounded by ``latest_seq``: a command committed between the latest-read
+        and this query must not get pickup stamped by a sweep that applied an
+        OLDER state (audit fidelity — the timer sweep collects it within 5s).
+        """
         rows = (
             await session.scalars(
                 select(EngineCommand)
-                .where(EngineCommand.applied_at.is_(None))
+                .where(EngineCommand.applied_at.is_(None), EngineCommand.seq <= latest_seq)
                 .order_by(EngineCommand.seq)
                 .with_for_update()
             )

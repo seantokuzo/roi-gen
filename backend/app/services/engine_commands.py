@@ -14,12 +14,16 @@ import uuid
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from sqlalchemy import select
+from sqlalchemy import func, or_, select, text
 
 from app.core.logging import get_logger
 from app.engine.commands import CHANNEL_ENGINE_COMMANDS, CommandPoke, heartbeat_key
-from app.engine.kill_switch import RESULT_FLAT_VERIFIED, RESULT_SUPERSEDED
-from app.models.engine_command import EngineCommand, derive_kill_state
+from app.models.engine_command import (
+    RESULT_FLAT_VERIFIED,
+    RESULT_SUPERSEDED,
+    EngineCommand,
+    derive_kill_state,
+)
 from app.models.enums import EngineCommandAction
 
 if TYPE_CHECKING:
@@ -32,11 +36,12 @@ DEFAULT_RESUME_REASON = "resume"
 
 
 class ResumeRefusedError(Exception):
-    """Resume refused: the latest command is a flatten without a verified outcome.
+    """Resume refused: a flatten since the last resume lacks a verified outcome.
 
     The flatten already canceled protective legs; re-arming with positions
     that may still be open and now unprotected is the one thing an operator
-    must not do casually. Verify flat first (watch ``status`` for
+    must not do casually — including via the "flatten → halt → resume"
+    two-step (review finding). Verify flat first (watch ``status`` for
     ``flat_verified``) or re-issue the flatten.
     """
 
@@ -88,10 +93,11 @@ async def issue_command(
 
     Raises :class:`ValueError` on a blank reason for halt/flatten (resume
     defaults to ``"resume"``) and :class:`ResumeRefusedError` when resume is
-    asked for while the latest command is a flatten whose ``result`` is not
-    ``flat_verified`` (and not ``superseded``). Note the guard reads the
-    LATEST row only: a halt issued after an unfinished flatten supersedes it
-    (the engine sweep marks it so), and resume is then allowed.
+    asked for while ANY flatten issued since the last resume lacks a verified
+    or superseded outcome. Deliberately stronger than latest-row-only (review
+    finding): "flatten → halt → resume" must not slip through — with the
+    engine DOWN nothing has superseded the flatten, its protective-leg cancels
+    may already be live, and the CLI matters most exactly then.
     """
     clean_reason = reason.strip()
     if not clean_reason:
@@ -100,20 +106,42 @@ async def issue_command(
             raise ValueError(msg)
         clean_reason = DEFAULT_RESUME_REASON
 
+    # Serialize command issuance: the resume guard is read-then-insert, and a
+    # concurrent flatten committed between the two must not be leapfrogged.
+    # Transaction-scoped advisory lock — released at the commit below.
+    await session.execute(text("SELECT pg_advisory_xact_lock(hashtext('roigen-engine-commands'))"))
+
     if action is EngineCommandAction.resume:
-        latest = await _latest_command(session)
-        if (
-            latest is not None
-            and latest.action == EngineCommandAction.flatten
-            and latest.result not in (RESULT_FLAT_VERIFIED, RESULT_SUPERSEDED)
-        ):
-            result = latest.result if latest.result is not None else "in flight"
+        last_resume_seq = await session.scalar(
+            select(func.max(EngineCommand.seq)).where(
+                EngineCommand.action == EngineCommandAction.resume.value
+            )
+        )
+        unresolved = (
+            await session.scalars(
+                select(EngineCommand)
+                .where(
+                    EngineCommand.action == EngineCommandAction.flatten.value,
+                    or_(
+                        EngineCommand.result.is_(None),  # in flight / engine down
+                        EngineCommand.result.notin_(
+                            (RESULT_FLAT_VERIFIED, RESULT_SUPERSEDED)
+                        ),  # e.g. failed: — possibly-naked positions
+                    ),
+                    EngineCommand.seq > (last_resume_seq or 0),
+                )
+                .order_by(EngineCommand.seq)
+            )
+        ).all()
+        if unresolved:
+            seqs = [row.seq for row in unresolved]
             msg = (
-                f"resume refused: the latest command (seq={latest.seq}) is a flatten whose "
-                f"result is {result!r}, not {RESULT_FLAT_VERIFIED!r}. That flatten already "
-                "canceled protective legs — re-arming while positions may still be open and "
-                "unprotected is the one thing an operator must not do casually. Verify flat "
-                "first (watch status for 'flat_verified') or re-issue flatten."
+                f"resume refused: flatten command(s) {seqs} since the last resume have no "
+                f"verified outcome ({RESULT_FLAT_VERIFIED!r} or {RESULT_SUPERSEDED!r}). A "
+                "flatten already cancels protective legs — re-arming while positions may "
+                "still be open and unprotected is the one thing an operator must not do "
+                "casually. Verify flat first (watch status for 'flat_verified'), let the "
+                "engine supersede the stale flatten, or re-issue flatten."
             )
             raise ResumeRefusedError(msg)
 
@@ -150,7 +178,10 @@ async def read_status(
     comes from Postgres and is trustworthy either way.
     """
     latest = await _latest_command(session)
-    state = derive_kill_state(latest.action if latest is not None else None)
+    state = derive_kill_state(
+        latest.action if latest is not None else None,
+        latest.result if latest is not None else None,
+    )
 
     key = heartbeat_key(portfolio_id)
     raw: object = None

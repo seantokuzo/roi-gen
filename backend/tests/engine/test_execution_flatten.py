@@ -434,13 +434,14 @@ async def test_one_symbols_broker_rejection_never_blocks_the_rest(
     assert len(rejected) == 1
     assert "insufficient qty" in rejected[0].payload["error"]
 
-    # Exactly one flatten summary row landed either way. (NOTE: the current
-    # implementation reports the rejected symbol as outcome "submitted" —
-    # see the review note on _liquidate_symbol / _submit_and_apply.)
-    summaries = await get_events(db_engine, "flatten.executed") + await get_events(
-        db_engine, "flatten.partial"
-    )
-    assert len(summaries) == 1
+    # The summary reports each ROW's truth, not "we tried": the rejected
+    # liquidation makes this pass flatten.partial, and the controller re-drives
+    # the leftover exposure on its next tick.
+    partial = await get_events(db_engine, "flatten.partial")
+    assert len(partial) == 1
+    outcomes = {o["symbol"]: o["outcome"] for o in partial[0].payload["outcomes"]}
+    assert outcomes == {"AAPL": "rejected", "MSFT": "submitted"}
+    assert await get_events(db_engine, "flatten.executed") == []
 
 
 async def test_a_total_broker_failure_for_one_symbol_reports_flatten_partial(
@@ -507,6 +508,75 @@ async def test_ambiguous_liquidation_submit_resolves_by_client_id_never_resubmit
 
     executed = await get_events(db_engine, "flatten.executed")
     assert len(executed) == 1  # resolved ≠ failed
+
+
+async def test_unresolved_ambiguous_liquidation_reports_outcome_ambiguous(
+    db_engine: AsyncEngine, db_session: AsyncSession, seeded_user: User
+) -> None:
+    # The submit dies mid-flight and every resolve lookup comes back empty: the
+    # order's fate is genuinely unknown. The row stays pending_submit for
+    # reconciliation to age out or adopt, and the summary says so — "ambiguous"
+    # is neither a success nor a proven failure.
+    portfolio = await _seeded_portfolio(db_session, seeded_user)
+    _event, approval = mint_flatten_approval(portfolio.id)
+    adapter = _FlattenAdapter(
+        db_engine,
+        positions=[make_broker_position("AAPL", qty=Decimal("10"))],
+        submit_errors={"AAPL": AmbiguousOrderState("gateway timeout mid-submit")},
+        lookup_results=[None, None],  # both resolve attempts find nothing
+    )
+    stage = _stage(db_engine, adapter)
+    await _drive(stage, approval)
+
+    assert len(adapter.submitted) == 1  # never blind-resubmitted
+    client_id = f"roigen-flatten-{approval.flatten_id.hex[:12]}-aapl"
+    assert (await _order_row(db_engine, client_id)).status == OrderStatus.pending_submit.value
+
+    partial = await get_events(db_engine, "flatten.partial")
+    assert len(partial) == 1
+    outcomes = {o["symbol"]: o["outcome"] for o in partial[0].payload["outcomes"]}
+    assert outcomes == {"AAPL": "ambiguous"}
+    assert await get_events(db_engine, "flatten.executed") == []
+    assert len(await get_events(db_engine, "order.submit_ambiguous")) == 1
+
+
+async def test_covered_symbol_is_not_liquidated_twice(
+    db_engine: AsyncEngine, db_session: AsyncSession, seeded_user: User
+) -> None:
+    # SPY already has a working liquidation from a prior drive: this pass must
+    # not cancel it, must not submit a second SPY liquidation (each re-drive
+    # tick would otherwise mint a held-qty rejection until the first fills),
+    # and must still close QQQ.
+    portfolio = await _seeded_portfolio(db_session, seeded_user)
+    _event, approval = mint_flatten_approval(portfolio.id)
+    prior_liq = make_broker_order(
+        broker_order_id="bo-prior-liq",
+        client_order_id="roigen-flatten-deadbeefcafe-spy",
+        symbol="SPY",
+        side=OrderSide.sell,
+        order_class=OrderClass.simple,
+    )
+    adapter = _FlattenAdapter(
+        db_engine,
+        open_orders=[prior_liq],
+        positions=[
+            make_broker_position("SPY", qty=Decimal("10")),
+            make_broker_position("QQQ", qty=Decimal("5")),
+        ],
+    )
+    stage = _stage(db_engine, adapter)
+    await _drive(stage, approval)
+
+    assert adapter.canceled == []  # its own kind is never canceled
+    assert [r.symbol for r in adapter.submitted] == ["QQQ"]  # no second SPY order
+
+    executed = await get_events(db_engine, "flatten.executed")
+    assert len(executed) == 1
+    outcomes = {o["symbol"]: (o["outcome"], o["detail"]) for o in executed[0].payload["outcomes"]}
+    assert outcomes["QQQ"][0] == "submitted"
+    assert outcomes["SPY"][0] == "submitted"  # in flight counts as submitted…
+    assert "covered" in outcomes["SPY"][1]  # …with the covered provenance
+    assert await get_events(db_engine, "flatten.partial") == []
 
 
 async def test_zero_qty_position_is_skipped_entirely(
