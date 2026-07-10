@@ -34,6 +34,8 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 
+from sqlalchemy import select
+
 from app.brokers.dto import OrderRequest
 from app.brokers.errors import (
     AmbiguousOrderState,
@@ -352,7 +354,9 @@ class ExecutionStage:
                     payload={"flatten_id": str(approval.flatten_id), "error": repr(exc)},
                 )
                 return
-        failures = [o for o in outcomes if o.outcome == "failed"]
+        # Anything short of an accepted submit is a non-close for summary
+        # purposes — the controller re-drives, and the operator must see why.
+        failures = [o for o in outcomes if o.outcome != "submitted"]
         await self._audit(
             "flatten.partial" if failures else "flatten.executed",
             portfolio_id=approval.portfolio_id,
@@ -485,6 +489,20 @@ class ExecutionStage:
                 symbol=symbol,
             )
             return _SymbolOutcome(symbol=symbol, outcome="failed", detail=repr(exc))
+        # _submit_and_apply absorbs broker refusals into the row (rejected /
+        # failed / left pending_submit on ambiguity) and returns normally — the
+        # flatten summary must report the row's TRUTH, not "we tried": a
+        # held-qty 403 here is the expected cancel-race outcome the controller
+        # re-drives on, and the audit row is what the operator reads.
+        async with self._session_factory() as session:
+            row = await session.scalar(
+                select(Order.status).where(Order.client_order_id == req.client_order_id)
+            )
+        status = row or OrderStatus.pending_submit.value
+        if status in (OrderStatus.rejected.value, OrderStatus.failed.value):
+            return _SymbolOutcome(symbol=symbol, outcome=status, detail=req.client_order_id)
+        if status == OrderStatus.pending_submit.value:
+            return _SymbolOutcome(symbol=symbol, outcome="ambiguous", detail=req.client_order_id)
         return _SymbolOutcome(symbol=symbol, outcome="submitted", detail=req.client_order_id)
 
     async def _submit_and_apply(
