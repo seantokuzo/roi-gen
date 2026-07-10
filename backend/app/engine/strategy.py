@@ -15,6 +15,7 @@ to the strategies that asked for each symbol.
 
 from __future__ import annotations
 
+import inspect
 from collections import defaultdict
 from typing import TYPE_CHECKING, Any
 
@@ -32,6 +33,8 @@ if TYPE_CHECKING:
     import uuid
     from collections.abc import Callable, Iterable, Mapping
     from decimal import Decimal
+
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
     from app.brokers.dto import Bar, Quote, Trade
     from app.engine.bus import EventBus
@@ -154,20 +157,37 @@ class StrategyRegistry:
         symbols: Iterable[str],
         bus: EventBus,
         params: Mapping[str, Any] | None = None,
+        session_factory: async_sessionmaker[AsyncSession] | None = None,
     ) -> Strategy:
-        """Instantiate the strategy registered under ``kind``."""
+        """Instantiate the strategy registered under ``kind``.
+
+        ``session_factory`` is infrastructure, not strategy config, so it is
+        deliberately NOT smuggled through ``params`` (that mapping mirrors the
+        JSONB config column and must stay JSON-shaped — a live DB handle in it
+        would leak into audit payloads). A strategy class opts in by declaring
+        a ``session_factory`` keyword in its own ``__init__`` (detected here
+        via :func:`inspect.signature`, e.g. the probe's DB-derived session
+        bound); classes that don't declare it are constructed exactly as
+        before, so pure in-memory strategies and tests never see it.
+        """
         try:
             cls = self._kinds[kind]
         except KeyError as exc:
             msg = f"unknown strategy kind {kind!r} (registered: {sorted(self._kinds)})"
             raise KeyError(msg) from exc
-        return cls(
-            strategy_id=strategy_id,
-            portfolio_id=portfolio_id,
-            symbols=symbols,
-            bus=bus,
-            params=params,
-        )
+        kwargs: dict[str, Any] = {
+            "strategy_id": strategy_id,
+            "portfolio_id": portfolio_id,
+            "symbols": symbols,
+            "bus": bus,
+            "params": params,
+        }
+        if (
+            session_factory is not None
+            and "session_factory" in inspect.signature(cls.__init__).parameters
+        ):
+            kwargs["session_factory"] = session_factory
+        return cls(**kwargs)
 
     def kinds(self) -> list[str]:
         return sorted(self._kinds)
