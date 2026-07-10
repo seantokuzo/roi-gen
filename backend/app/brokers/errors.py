@@ -26,9 +26,13 @@ class BrokerError(Exception):
 
 
 class BrokerAuthError(BrokerError):
-    """Credentials are bad / unauthorized (HTTP 401 or 403).
+    """Credentials are bad / unauthorized (HTTP 401, or an auth-shaped 403).
 
     Not retryable: the same keys will keep failing. Surface to the operator.
+    Alpaca also reuses HTTP 403 for order-level refusals — those are carved
+    out into :class:`OrderRejected` / :class:`OrderRefused` by the adapter,
+    and any 403 it cannot positively classify as order-level fails closed
+    into this type.
     """
 
 
@@ -51,13 +55,53 @@ class BrokerRateLimited(BrokerError):
 
 
 class OrderRejected(BrokerError):
-    """DEFINITIVE order-level rejection (HTTP 422/400).
+    """DEFINITIVE order-level rejection (HTTP 422/400, or an order-level 403
+    on submit).
 
     The broker received the request and refused it (bad symbol, insufficient
     buying power, malformed bracket, etc.). The order was NOT placed, so it is
     safe to treat as not-placed and surface the rejection — do not reconcile,
     there is nothing on the broker side to find.
+
+    ``retryable_held_qty`` flags Alpaca's "insufficient qty available"
+    refusal: the shares are held by protective legs (the bracket-leg
+    cancel/close race), so the SAME submit becomes valid once the legs are
+    confirmed canceled. It is the one rejection a flatten path may retry;
+    everything else is final.
     """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        retryable_held_qty: bool = False,
+    ) -> None:
+        super().__init__(message, status_code=status_code)
+        self.retryable_held_qty = retryable_held_qty
+
+
+class OrderRefused(BrokerError):
+    """Order-level refusal on a NON-submit call (HTTP 403).
+
+    Alpaca reuses 403 for order-level refusals (held qty, insufficient buying
+    power, wash-trade blocks) on mutations other than submit — e.g. closing a
+    position whose shares the bracket legs still hold. Distinct from
+    :class:`BrokerAuthError` (nothing is wrong with the keys) and from
+    :class:`OrderRejected` (whose "never placed" semantics are submit-only).
+    Carries the same ``retryable_held_qty`` discriminator as
+    :class:`OrderRejected`.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = 403,
+        retryable_held_qty: bool = False,
+    ) -> None:
+        super().__init__(message, status_code=status_code)
+        self.retryable_held_qty = retryable_held_qty
 
 
 class BrokerUnavailable(BrokerError):

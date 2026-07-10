@@ -75,10 +75,25 @@ def _trade_updates_channel(portfolio_id: str) -> str:
     return f"broker:trade_updates:{portfolio_id}"
 
 
+def feed_health_key(portfolio_id: str) -> str:
+    """Level-based feed-health key: ``engine:feed_health:{portfolio_id}``.
+
+    Written via ``SETEX`` with TTL = 2× the staleness window; the value is
+    JSON ``{"status": "ok"|"stale", "at": <iso>}``. Absence of the key (TTL
+    lapsed, watchdog dead, Redis restarted) reads as STALE — the fail-closed
+    half of the feed gate, because edge-triggered pub/sub transitions are
+    lossy. Public so the engine-side poller derives the identical key.
+    """
+    return f"engine:feed_health:{portfolio_id}"
+
+
 # ── Reconnect / watchdog tuning ──────────────────────────────────────
 _BACKOFF_BASE_SECONDS = 1.0
 _BACKOFF_CAP_SECONDS = 30.0
 _DEFAULT_STALENESS_SECONDS = 30.0
+#: Minimum spacing between throttled feed-health key refreshes: _mark_alive
+#: runs per message, and a busy feed must not turn every tick into a SETEX.
+_FEED_HEALTH_REFRESH_SECONDS = 1.0
 
 
 # Order-status translation is shared with the REST adapter — one source of
@@ -203,10 +218,12 @@ class _RedisLike(Protocol):
     ``publish`` is typed as returning an :class:`~collections.abc.Awaitable`
     rather than as ``async def`` so BOTH the real ``redis.asyncio.Redis``
     (whose ``publish`` returns ``Awaitable[int]``) and an ``async def`` fake
-    satisfy it structurally.
+    satisfy it structurally. ``setex`` carries the level-based feed-health key
+    (see :func:`feed_health_key`).
     """
 
     def publish(self, channel: str, message: str) -> Awaitable[Any]: ...
+    def setex(self, name: str, time: int, value: str) -> Awaitable[Any]: ...
 
 
 class _MarketStreamLike(Protocol):
@@ -363,7 +380,11 @@ class AlpacaMarketDataConsumer(_SupervisedStreamConsumer):
     ``staleness_seconds`` (default 30) while the feed is expected live — the
     signal the risk layer uses to block new entries during a feed blackout
     (project gotcha: RTH feed silence ⇒ block entries). It clears with
-    ``feed_ok`` as soon as data resumes.
+    ``feed_ok`` as soon as data resumes. Those pub/sub transitions are
+    edge-triggered and lossy, so when a ``portfolio_id`` is supplied the
+    consumer ALSO maintains the level-based ``engine:feed_health:{id}`` key
+    (see :func:`feed_health_key`) that the engine polls fail-closed —
+    key absent ⇒ stale.
     """
 
     def __init__(
@@ -373,6 +394,7 @@ class AlpacaMarketDataConsumer(_SupervisedStreamConsumer):
         symbols: Iterable[str],
         *,
         feed: str = "iex",
+        portfolio_id: str | None = None,
         subscribe_quotes: bool = False,
         subscribe_trades: bool = False,
         staleness_seconds: float = _DEFAULT_STALENESS_SECONDS,
@@ -406,6 +428,14 @@ class AlpacaMarketDataConsumer(_SupervisedStreamConsumer):
         self._last_msg_at: float | None = None
         self._feed_stale = False
         self._watchdog_task: asyncio.Task[None] | None = None
+
+        # Level-based feed-health key (None → pub/sub transitions only; the
+        # engine wires its portfolio id so the fail-closed poller has a key).
+        self._feed_health_key = None if portfolio_id is None else feed_health_key(portfolio_id)
+        # TTL 2× the window: a dead watchdog lapses the key within one extra
+        # window, and the reader treats absence as stale.
+        self._feed_health_ttl = max(1, int(staleness_seconds * 2))
+        self._last_health_write = float("-inf")
 
     # -- stream construction --------------------------------------------------
 
@@ -474,25 +504,38 @@ class AlpacaMarketDataConsumer(_SupervisedStreamConsumer):
         """Record a fresh data point; clear staleness + reset backoff.
 
         If the feed was flagged stale, publish a ``feed_ok`` clear so the risk
-        layer can re-enable entries the moment data resumes.
+        layer can re-enable entries the moment data resumes. Every data point
+        also refreshes the level-based health key (throttled); the stale→ok
+        flip bypasses the throttle so the key never lags the transition.
         """
         self._last_msg_at = self._now()
         self._reset_backoff()
         if self._feed_stale:
             self._feed_stale = False
             await self._publish_feed_status("feed_ok")
+            await self._write_feed_health("ok", force=True)
+        else:
+            await self._write_feed_health("ok")
 
     async def _watchdog_loop(self) -> None:
         """Emit ``feed_stale`` once no data has arrived for the timeout window.
 
         Re-checks on a fraction of the timeout so detection latency is bounded;
         clearing back to ``feed_ok`` is handled inline by :meth:`_mark_alive`
-        the instant data resumes.
+        the instant data resumes. While healthy it also refreshes the health
+        key so a quiet-but-alive feed keeps the key present — key absence must
+        mean the watchdog itself is dead (or Redis restarted), never mere
+        quiet.
         """
         while True:
             await asyncio.sleep(self._watchdog_poll)
             last = self._last_msg_at
             if last is None:
+                # Defensive seed: start() marks alive before spawning us, but
+                # if that ever changes a None here must START the staleness
+                # clock, not disable it — a boot that never receives data has
+                # to go stale one window later.
+                self._last_msg_at = self._now()
                 continue
             stale = (self._now() - last) >= self._staleness_seconds
             if stale and not self._feed_stale:
@@ -504,6 +547,9 @@ class AlpacaMarketDataConsumer(_SupervisedStreamConsumer):
                     symbols=self._symbols,
                 )
                 await self._publish_feed_status("feed_stale")
+                await self._write_feed_health("stale", force=True)
+            elif not stale:
+                await self._write_feed_health("ok")
 
     async def _publish_feed_status(self, status: str) -> None:
         """Publish a feed status object to ``engine:feed_status``."""
@@ -515,6 +561,25 @@ class AlpacaMarketDataConsumer(_SupervisedStreamConsumer):
             "timestamp": self._now_iso(),
         }
         await self._redis.publish(CHANNEL_FEED_STATUS, json.dumps(payload))
+
+    async def _write_feed_health(self, status: str, *, force: bool = False) -> None:
+        """``SETEX`` the level-based feed-health key (no-op without a key).
+
+        TTL is 2× the staleness window: if this process dies, Redis restarts,
+        or the watchdog stops running, the key lapses and the engine-side
+        poller reads ABSENT = stale (fail-closed). Refreshes are throttled to
+        one per ``_FEED_HEALTH_REFRESH_SECONDS`` so a busy feed doesn't turn
+        every message into a Redis write; status transitions pass
+        ``force=True`` and always land.
+        """
+        if self._feed_health_key is None:
+            return
+        now = self._now()
+        if not force and now - self._last_health_write < _FEED_HEALTH_REFRESH_SECONDS:
+            return
+        self._last_health_write = now
+        payload = {"status": status, "at": self._now_iso()}
+        await self._redis.setex(self._feed_health_key, self._feed_health_ttl, json.dumps(payload))
 
     # -- clock (overridable in tests) -----------------------------------------
 

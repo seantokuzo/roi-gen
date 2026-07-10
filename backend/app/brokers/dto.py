@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from datetime import date, datetime
 from decimal import Decimal
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -45,14 +45,21 @@ class MarketClock(BaseModel):
 
 class CalendarDay(BaseModel):
     """A single trading session. ``trading_date`` is the calendar date; the
-    open/close are tz-aware UTC instants for that session (early-close days
-    carry their actual shortened close)."""
+    RTH open/close are tz-aware UTC instants for that session (early-close
+    days carry their actual shortened close).
+
+    Named ``rth_*`` deliberately: the real ``/v2/calendar`` payload has BOTH
+    ``open``/``close`` (RTH, ``"09:30"`` colon format — what we parse) and
+    ``session_open``/``session_close`` (extended session 4:00–20:00, ``"0400"``
+    no-colon format). The old ``session_*`` field names invited mapping the
+    wrong pair — an extended 20:00 close would silently turn a 15:55 flatten
+    into a 19:55 one."""
 
     model_config = ConfigDict(frozen=True)
 
     trading_date: date
-    session_open: datetime
-    session_close: datetime
+    rth_open: datetime
+    rth_close: datetime
 
 
 # ── Account / positions ──────────────────────────────────────────────
@@ -104,6 +111,12 @@ class BrokerPosition(BaseModel):
 
 # ── Orders ───────────────────────────────────────────────────────────
 
+#: Explicit open/close intent for an order. A ``*_to_close`` intent makes a
+#: liquidation incapable of flipping through zero into an opposite position
+#: when quantities race (the flatten path submits with it for exactly that
+#: reason). ``None`` leaves the broker's side-based default in force.
+PositionIntent = Literal["buy_to_open", "buy_to_close", "sell_to_open", "sell_to_close"]
+
 
 class OrderRequest(BaseModel):
     """An order to SUBMIT.
@@ -132,6 +145,7 @@ class OrderRequest(BaseModel):
     stop_price: Decimal | None = None
     trail_percent: Decimal | None = None
     extended_hours: bool = False
+    position_intent: PositionIntent | None = None
     take_profit_limit_price: Decimal | None = None
     stop_loss_stop_price: Decimal | None = None
     stop_loss_limit_price: Decimal | None = None

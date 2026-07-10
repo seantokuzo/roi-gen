@@ -27,6 +27,7 @@ from app.brokers.errors import (
     BrokerRateLimited,
     BrokerUnavailable,
     CredentialsNotFound,
+    OrderRefused,
     OrderRejected,
 )
 from app.brokers.ratelimit import AsyncTokenBucket
@@ -48,6 +49,7 @@ __all__ = [
     "CalendarDay",
     "CredentialsNotFound",
     "MarketClock",
+    "OrderRefused",
     "OrderRejected",
     "OrderRequest",
     "Quote",
