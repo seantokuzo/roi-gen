@@ -15,15 +15,17 @@ from typing import TYPE_CHECKING
 import pytest_asyncio
 from sqlalchemy import select
 
+from app.engine.execution.lots import UNAPPLIED_REMAINDER_EVENT, apply_fill_to_lots
 from app.models.enums import OrderClass, OrderSide, OrderStatus, OrderType, PortfolioMode
 from app.models.portfolio import Portfolio
 from app.models.telemetry import EventLog
-from app.models.trading import Fill, Lot, Order, Position
+from app.models.trading import Fill, Lot, LotClose, Order, Position
 from app.services.reconciliation import ReconciliationService
 from tests.engine.builders import (
     RecordingAdapter,
     make_account,
     make_broker_order,
+    seed_lot,
     seed_order,
     seed_strategy,
 )
@@ -429,3 +431,277 @@ async def test_boot_adopts_missing_leg_rows_from_nested_parents(
     assert children[0].broker_order_id == "bo-leg-sl"
     assert children[0].client_order_id == "alpaca-leg-sl"
     assert children[0].strategy_id == strategy.id
+
+
+# ── Parked-remainder retry (strategy-less liquidation overshoot) ─────
+
+_PARKED_AT = datetime(2026, 7, 2, 15, 30, tzinfo=UTC)
+
+
+async def _events(db_session: AsyncSession, event_type: str) -> list[EventLog]:
+    return list(
+        (
+            await db_session.execute(
+                select(EventLog).where(EventLog.event_type == event_type).order_by(EventLog.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+
+async def _park_remainder(
+    db_session: AsyncSession, portfolio: Portfolio, *, qty: str, price: str = "110"
+) -> None:
+    """A strategy-less (flatten) fill with nothing to close: parks its full qty."""
+    application = await apply_fill_to_lots(
+        db_session,
+        portfolio_id=portfolio.id,
+        strategy_id=None,
+        symbol="SPY",
+        side=OrderSide.sell,
+        qty=Decimal(qty),
+        price=Decimal(price),
+        occurred_at=_PARKED_AT,
+    )
+    assert application.qty_closed == Decimal("0")
+    assert application.unapplied_qty == Decimal(qty)
+    await db_session.commit()
+
+
+async def test_parked_remainder_retry_applies_when_lots_appear(
+    db_session: AsyncSession, portfolio: Portfolio, seeded_user: User
+) -> None:
+    strategy = await seed_strategy(db_session, portfolio.id)
+    await _park_remainder(db_session, portfolio, qty="50")
+
+    # Cycle 1: still nothing to close — retry fails, no resolution, no lots.
+    service = ReconciliationService()
+    await service.reconcile_portfolio(
+        db_session, portfolio.id, RecordingAdapter(), synthesize_fills=True
+    )
+    await db_session.commit()
+    assert len(await _events(db_session, "lots.unapplied_remainder_retry_failed")) == 1
+    assert await _events(db_session, "lots.unapplied_remainder_resolved") == []
+    assert (await db_session.execute(select(Lot))).scalars().all() == []
+
+    # The missing entry materializes (a later synthesis, here seeded directly).
+    await seed_lot(
+        db_session,
+        portfolio.id,
+        strategy.id,
+        qty_orig=Decimal("50"),
+        qty_open=Decimal("50"),
+        entry_price=Decimal("100"),
+        opened_at=datetime(2026, 7, 2, 15, 0, tzinfo=UTC),
+    )
+    await db_session.commit()
+
+    await service.reconcile_portfolio(
+        db_session, portfolio.id, RecordingAdapter(), synthesize_fills=True
+    )
+    await db_session.commit()
+
+    lot = (await db_session.execute(select(Lot))).scalars().one()  # no phantom short
+    assert lot.qty_open == Decimal("0")
+    assert lot.closed_at == _PARKED_AT
+    close = (await db_session.execute(select(LotClose))).scalars().one()
+    assert close.strategy_id == strategy.id  # the LOT's strategy, not NULL
+    assert close.qty == Decimal("50")
+    assert close.realized_pnl == Decimal("500")  # (110 − 100) × 50
+
+    anomaly = (await _events(db_session, UNAPPLIED_REMAINDER_EVENT))[0]
+    resolved = await _events(db_session, "lots.unapplied_remainder_resolved")
+    assert len(resolved) == 1
+    assert resolved[0].payload["anomaly_event_id"] == anomaly.id
+    assert Decimal(resolved[0].payload["applied_qty"]) == Decimal("50")
+    assert resolved[0].payload["residual_qty"] == "0"
+
+    # Resolved anomalies are not retried again: another cycle adds nothing.
+    await service.reconcile_portfolio(
+        db_session, portfolio.id, RecordingAdapter(), synthesize_fills=True
+    )
+    await db_session.commit()
+    assert len(await _events(db_session, "lots.unapplied_remainder_resolved")) == 1
+    assert len(await _events(db_session, "lots.unapplied_remainder_retry_failed")) == 1
+
+
+async def test_unapplied_remainder_alerts_after_three_cycles(
+    db_session: AsyncSession, portfolio: Portfolio, seeded_user: User
+) -> None:
+    await _park_remainder(db_session, portfolio, qty="25")
+    service = ReconciliationService()
+
+    for cycle in range(1, 5):
+        await service.reconcile_portfolio(
+            db_session, portfolio.id, RecordingAdapter(), synthesize_fills=True
+        )
+        await db_session.commit()
+        failed = await _events(db_session, "lots.unapplied_remainder_retry_failed")
+        alerts = await _events(db_session, "lots.unapplied_remainder_alert")
+        assert len(failed) == cycle  # every failed cycle stays on the audit trail
+        if cycle < 3:
+            assert alerts == []
+        else:
+            assert len(alerts) == 1  # fires at cycle 3, once — never re-alerts
+
+    alerts = await _events(db_session, "lots.unapplied_remainder_alert")
+    assert alerts[0].payload["cycles"] == 3
+    assert Decimal(alerts[0].payload["qty"]) == Decimal("25")
+
+
+async def test_partial_remainder_retry_resolves_and_supersedes_with_residual(
+    db_session: AsyncSession, portfolio: Portfolio, seeded_user: User
+) -> None:
+    """Partial application closes the original anomaly and parks a fresh, smaller
+    one — an open anomaly's payload qty is always exactly what remains."""
+    strategy = await seed_strategy(db_session, portfolio.id)
+    await _park_remainder(db_session, portfolio, qty="50")
+    await seed_lot(
+        db_session,
+        portfolio.id,
+        strategy.id,
+        qty_orig=Decimal("30"),
+        qty_open=Decimal("30"),
+        entry_price=Decimal("100"),
+        opened_at=datetime(2026, 7, 2, 15, 0, tzinfo=UTC),
+    )
+    await db_session.commit()
+
+    service = ReconciliationService()
+    await service.reconcile_portfolio(
+        db_session, portfolio.id, RecordingAdapter(), synthesize_fills=True
+    )
+    await db_session.commit()
+
+    anomalies = await _events(db_session, UNAPPLIED_REMAINDER_EVENT)
+    assert len(anomalies) == 2
+    original, successor = anomalies
+    assert Decimal(successor.payload["qty"]) == Decimal("20")
+    assert successor.payload["superseded_anomaly_event_id"] == original.id
+    resolved = await _events(db_session, "lots.unapplied_remainder_resolved")
+    assert len(resolved) == 1
+    assert resolved[0].payload["anomaly_event_id"] == original.id
+    assert Decimal(resolved[0].payload["applied_qty"]) == Decimal("30")
+    assert Decimal(resolved[0].payload["realized_pnl"]) == Decimal("300")
+    assert Decimal(resolved[0].payload["residual_qty"]) == Decimal("20")
+
+    # The rest of the entry appears; the residual heals on the next cycle.
+    await seed_lot(
+        db_session,
+        portfolio.id,
+        strategy.id,
+        qty_orig=Decimal("20"),
+        qty_open=Decimal("20"),
+        entry_price=Decimal("105"),
+        opened_at=datetime(2026, 7, 2, 15, 1, tzinfo=UTC),
+    )
+    await db_session.commit()
+    await service.reconcile_portfolio(
+        db_session, portfolio.id, RecordingAdapter(), synthesize_fills=True
+    )
+    await db_session.commit()
+
+    resolved = await _events(db_session, "lots.unapplied_remainder_resolved")
+    assert len(resolved) == 2
+    assert resolved[1].payload["anomaly_event_id"] == successor.id
+    assert resolved[1].payload["residual_qty"] == "0"
+    closes = (
+        (await db_session.execute(select(LotClose).order_by(LotClose.qty.desc()))).scalars().all()
+    )
+    assert [(c.qty, c.realized_pnl) for c in closes] == [
+        (Decimal("30"), Decimal("300")),  # (110 − 100) × 30
+        (Decimal("20"), Decimal("100")),  # (110 − 105) × 20
+    ]
+    assert all(c.strategy_id == strategy.id for c in closes)
+
+
+async def test_interleaved_entry_after_liquidation_heals_end_to_end(
+    db_session: AsyncSession, portfolio: Portfolio, seeded_user: User
+) -> None:
+    """The 2c race: the flatten liquidation's fill lands BEFORE the entry it is
+    flattening is known locally. Park → the entry surfaces → one reconcile both
+    synthesizes the entry lot (deficit sweep) and applies the parked remainder
+    (retry pass). End state: lots closed, P&L attributed, no phantom lots."""
+    strategy = await seed_strategy(db_session, portfolio.id)
+
+    # 1) The liquidation order + its streamed fill (the writer's work): the
+    # Fill row lands with real qty/price, but the lot application overshoots
+    # everything known and parks in full.
+    liq_order = await seed_order(
+        db_session,
+        portfolio.id,
+        None,
+        client_order_id="roigen-flatten-abcd1234-SPY",
+        broker_order_id="bo-liq",
+        side=OrderSide.sell,
+        order_class=OrderClass.simple,
+        status=OrderStatus.filled,
+        qty=Decimal("100"),
+        filled_qty=Decimal("100"),
+    )
+    liq_fill = Fill(
+        order_id=liq_order.id,
+        broker_fill_id="exec-liq",
+        qty=Decimal("100"),
+        price=Decimal("105"),
+        occurred_at=_PARKED_AT,
+    )
+    db_session.add(liq_fill)
+    await db_session.flush()
+    application = await apply_fill_to_lots(
+        db_session,
+        portfolio_id=portfolio.id,
+        strategy_id=None,
+        symbol="SPY",
+        side=OrderSide.sell,
+        qty=Decimal("100"),
+        price=Decimal("105"),
+        occurred_at=_PARKED_AT,
+        order_id=liq_order.id,
+        fill_id=liq_fill.id,
+    )
+    assert application.unapplied_qty == Decimal("100")
+    assert application.opened_lot_id is None  # no phantom short minted
+
+    # 2) The entry order surfaces AFTERWARDS: filled at the broker, zero Fill
+    # rows locally — a ledger deficit the sweep repairs from local columns.
+    entry = await seed_order(
+        db_session,
+        portfolio.id,
+        strategy.id,
+        broker_order_id="bo-entry",
+        side=OrderSide.buy,
+        order_class=OrderClass.simple,
+        status=OrderStatus.filled,
+        qty=Decimal("100"),
+        filled_qty=Decimal("100"),
+    )
+    entry.filled_avg_price = Decimal("100")
+    await db_session.commit()
+
+    result = await ReconciliationService().reconcile_portfolio(
+        db_session, portfolio.id, RecordingAdapter(), synthesize_fills=True
+    )
+    await db_session.commit()
+
+    assert result.fills_synthesized == 1  # the entry
+    lot = (await db_session.execute(select(Lot))).scalars().one()  # ONLY the entry lot
+    assert lot.strategy_id == strategy.id
+    assert lot.side == OrderSide.buy.value
+    assert lot.qty_open == Decimal("0")
+    assert lot.closed_at == _PARKED_AT
+    assert lot.realized_pnl == Decimal("500")  # (105 − 100) × 100
+
+    close = (await db_session.execute(select(LotClose))).scalars().one()
+    assert close.strategy_id == strategy.id  # breaker sees it on the strategy
+    assert close.order_id == liq_order.id
+    assert close.fill_id == liq_fill.id
+    assert close.qty == Decimal("100")
+    assert close.realized_pnl == Decimal("500")
+
+    resolved = await _events(db_session, "lots.unapplied_remainder_resolved")
+    assert len(resolved) == 1
+    assert Decimal(resolved[0].payload["applied_qty"]) == Decimal("100")
+    assert resolved[0].payload["residual_qty"] == "0"
+    assert await _events(db_session, "lots.unapplied_remainder_retry_failed") == []
