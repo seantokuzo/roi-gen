@@ -91,10 +91,14 @@ class EngineCommandSweeper:
             try:
                 await pubsub.subscribe(CHANNEL_ENGINE_COMMANDS)
                 log.info("engine.commands.subscribed", channel=CHANNEL_ENGINE_COMMANDS)
-                async for message in pubsub.listen():
-                    if shutdown.is_set():
-                        break
-                    if message.get("type") != "message":
+                # get_message(timeout=…), never the blocking `listen()`: the
+                # engine's Redis client sets socket_timeout=5s, so a blocking
+                # read raises on ANY 5s lull — and this channel is silent by
+                # design. That churned a resubscribe every 5 seconds forever
+                # (dress-rehearsal finding), adding seconds of command latency.
+                while not shutdown.is_set():
+                    message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
+                    if message is None:
                         continue
                     self._note_poke(message.get("data"))
             except asyncio.CancelledError:

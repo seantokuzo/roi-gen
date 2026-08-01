@@ -20,26 +20,84 @@ strategy enters a bracket off a live bar → kill-switch `flatten` via the real
 CLI → broker-verified flat → full audit chain asserted from rows. Never runs in
 CI; deselected from plain `pytest` by marker.
 
-Preconditions (all local):
-- Postgres up (compose `db` or the brew fallback) — the suite creates/migrates its own `*_test` DB.
-- Redis up. The test uses DB index 9 by default (`ROIGEN_LIVE_REDIS_URL` to override).
-- Paper keys in the environment (`ALPACA_API_KEY`/`ALPACA_SECRET_KEY`) — use the **`roi-gen-dev` paper account, and treat it as ENGINE-ONLY**: the flatten controller cancels/closes EVERYTHING in the account, including anything you placed by hand, and the test skips if the account isn't flat.
-- Market open, with ≥20 minutes before the close (entries are risk-blocked inside the flatten buffer).
-- No other engine running against that account (a second market-data socket 406s; the advisory lock also blocks a same-DB second engine).
+### Preconditions (all local)
 
-Run:
+- **Postgres up** (compose `db`, or the brew fallback — brew Postgres 17 + pgvector also works and is what's currently listening on 5432). The suite creates/migrates its own `*_test` DB.
+- **Redis up** — this is a real prerequisite, not an assumption. It is NOT started by the test:
+
+  ```bash
+  cd /path/to/roi-gen && docker compose up -d redis
+  docker exec roigen-redis redis-cli ping   # → PONG
+  ```
+
+  The test uses **DB index 9** by default (`ROIGEN_LIVE_REDIS_URL` to override), so it never collides with the dev engine on DB 0.
+- **Paper keys** — `tests/live/conftest.py` loads the **repo-root `.env`** into `os.environ` before the suite runs, so `ALPACA_API_KEY`/`ALPACA_SECRET_KEY` come from `.env` automatically. You do NOT need to export anything. Details:
+  - It is gated on `ROIGEN_LIVE_E2E=1`, so a plain `pytest` run is completely unaffected (verified: zero env vars added).
+  - It never overrides an already-exported variable — `ALPACA_API_KEY=... uv run pytest ...` still wins.
+  - Why it's needed: `Settings` uses `env_file=".env"`, which pydantic-settings resolves relative to **CWD**. The runbook runs from `backend/`, where there is no `.env`. Before this shim the run skipped with `ALPACA_API_KEY / ALPACA_SECRET_KEY not set` even mid-session.
+  - The engine + CLI subprocesses inherit all of it (the test builds `child_env` from `os.environ`).
+- **The paper account must be FLAT and ENGINE-ONLY.** Use the `roi-gen-dev` paper account. The flatten controller cancels/closes EVERYTHING in the account, including anything you placed by hand, and the test skips with `paper account not flat: [...]` if any position is open. Check before you start:
+
+  ```bash
+  # positions must be [], open orders must be []
+  ```
+
+  (Verified flat on 2026-08-01: account `PA3E3NSRUF91`, equity $5,000, 0 positions, 0 orders ever.)
+- **Market open**, with ≥20 minutes before the close (entries are risk-blocked inside the flatten buffer). Outside RTH the test self-skips with `market closed (next open ...)` — that skip is the correct, healthy outcome, and it proves the env gate passed.
+- **No other engine running** against that account: a second market-data socket gets a 406, and the Postgres advisory lock refuses a same-portfolio second engine (`engine.singleton_lock_held`). Check with `pgrep -fl 'app.engine_main'`.
+
+### Run
 
 ```bash
 cd backend
-ROIGEN_LIVE_E2E=1 uv run pytest -m live_paper tests/live/ -q -s
+ROIGEN_LIVE_E2E=1 uv run pytest -m live_paper tests/live/ -q -rs
 ```
 
+`-rs` prints the skip reason, which is what you want when the gates don't pass.
+(`-s` instead of `-rs` if you want the engine log tail streamed live.)
+
 Expected: one test, ~2–6 minutes (dominated by waiting for the first 1-minute
-bar). On failure the engine subprocess's log tail is printed for forensics.
+bar). On failure the engine subprocess's log tail is printed for forensics, and
+the full log file path is echoed.
+
 What paper proves: plumbing + audit trail (order flow, stream writer, FIFO
 lots, command lifecycle, flatten completion). What it can't prove: fill
 realism (paper fills are optimistic NBBO — the Phase-3+ slippage haircut
 exists for that).
+
+### Known blockers found in the closed-market dress rehearsal (2026-08-01)
+
+The engine was booted for real against the paper account with the market closed.
+Boot reconcile, heartbeat/task-liveness, the trade-updates websocket, the
+kill-switch round trip, the singleton lock and graceful shutdown all passed. Two
+defects surfaced that the offline suite cannot see:
+
+1. **FIXED — `market_data` could die permanently on a transient Redis error at
+   boot.** `AlpacaMarketDataConsumer.start()` awaited the first feed-health
+   `SETEX` *outside* the supervisor's try/except, so one `redis.TimeoutError`
+   killed the task for good; because that task is `critical`, the composite
+   `halted()` then blocked every entry for the life of the process — behind a
+   heartbeat that still reported "running". Hit once in five cold boots. The
+   health/status writes are now best-effort (fail toward "stale", the safe
+   direction), with regression tests.
+
+2. **OPEN — the staleness gate false-positives on a bars-only feed.** The engine
+   subscribes to **minute bars only**, but `staleness_seconds` is 30s. Bars
+   arrive every 60s, so on a perfectly healthy feed the level flips
+   `ok → stale → ok` every minute and `alpaca.feed.stale` fires every minute.
+   `FeedHealth` polls that level every 5s, so at the instant a bar arrives the
+   gate still reads STALE — and the probe emits its signal on exactly that
+   bar, with `max_entries_per_session = 1`. **Decide this before the next
+   live-paper attempt**; until then expect the entry to be risk-rejected and
+   the run to time out at `probe entry order filled`.
+
+### Note on DEBUG logs
+
+`DEBUG=true` (which the test forces on the child) turns on the websockets frame
+logger, which prints the trade-stream `authenticate` frame — including a partial
+`key_id`. The engine log file and the on-failure tail therefore contain a
+fragment of the paper API key. Fine locally; don't paste a raw tail into an
+issue or a PR.
 
 ## Before Phase 9 (going live with real money)
 

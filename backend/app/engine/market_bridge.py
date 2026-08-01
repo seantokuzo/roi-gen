@@ -49,10 +49,15 @@ class MarketDataBridge:
             try:
                 await pubsub.subscribe(CHANNEL_BAR, CHANNEL_QUOTE, CHANNEL_TRADE)
                 log.info("engine.market_bridge.subscribed")
-                async for message in pubsub.listen():
-                    if shutdown.is_set():
-                        break
-                    if message.get("type") != "message":
+                # get_message(timeout=…), never the blocking `listen()`: the
+                # engine's Redis client sets socket_timeout=5s, so a blocking
+                # read raises on any 5s lull — and bars arrive once a MINUTE.
+                # That churned a resubscribe every 5 seconds forever, with a
+                # window on each cycle where a bar could be missed entirely
+                # (dress-rehearsal finding).
+                while not shutdown.is_set():
+                    message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
+                    if message is None:
                         continue
                     await self._dispatch(message.get("data"))
             except asyncio.CancelledError:
