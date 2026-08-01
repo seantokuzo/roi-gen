@@ -18,7 +18,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from app.core.logging import get_logger
-from app.engine.events import OrderEvent, SignalEvent
+from app.engine.events import FlattenEvent, FlattenOrderEvent, OrderEvent, SignalEvent
 from app.models.enums import EventSource
 from app.models.telemetry import EventLog
 
@@ -63,6 +63,7 @@ class RiskStage:
 
     def register_handlers(self) -> None:
         self._bus.subscribe(SignalEvent, self._on_signal)
+        self._bus.subscribe(FlattenEvent, self._on_flatten)
 
     async def _on_signal(self, signal: SignalEvent) -> None:
         try:
@@ -139,6 +140,94 @@ class RiskStage:
             symbol=signal.symbol,
             reason=decision.reason,
         )
+
+    async def _on_flatten(self, event: FlattenEvent) -> None:
+        """Authorize a flatten and hand it to execution — WITHOUT the halted gate.
+
+        Flatten must run under the kill switch, under feed-staleness, and while
+        entries are frozen: it is the mechanism those states rely on to get the
+        book safe. ``authorize_flatten`` is pure on the event (no state load),
+        so a broker/DB outage cannot block the safety path here — only the
+        audit write can fail, and that failure is itself audited.
+        """
+        try:
+            decision = self._engine.authorize_flatten(event)
+            async with self._session_factory() as session:
+                if decision.approved and decision.approval is not None:
+                    session.add(
+                        EventLog(
+                            source=EventSource.engine.value,
+                            event_type="flatten.approved",
+                            portfolio_id=event.portfolio_id,
+                            payload=decision.approval.audit_payload(),
+                        )
+                    )
+                    await session.commit()
+                    log.info(
+                        "engine.risk.flatten_approved",
+                        flatten_id=str(event.flatten_id),
+                        source=event.source,
+                        reason=event.reason,
+                    )
+                    await self._bus.publish(FlattenOrderEvent(approval=decision.approval))
+                    return
+                session.add(
+                    EventLog(
+                        source=EventSource.engine.value,
+                        event_type="flatten.rejected",
+                        portfolio_id=event.portfolio_id,
+                        payload={
+                            "flatten_id": str(event.flatten_id),
+                            "source": event.source,
+                            "reason": decision.reason,
+                            "checks": [c.to_dict() for c in decision.checks],
+                        },
+                    )
+                )
+                await session.commit()
+                # A rejected flatten is a wiring bug, not a market condition.
+                log.error(
+                    "engine.risk.flatten_rejected",
+                    flatten_id=str(event.flatten_id),
+                    source=event.source,
+                    reason=decision.reason,
+                )
+        except Exception as exc:  # noqa: BLE001 — the safety path must be auditable, not silent
+            log.error(
+                "engine.risk.flatten_error",
+                flatten_id=str(event.flatten_id),
+                source=event.source,
+                error=repr(exc),
+            )
+            await self._audit_flatten_error(event, exc)
+
+    async def _audit_flatten_error(self, event: FlattenEvent, exc: Exception) -> None:
+        """Mirror of :meth:`_audit_error` for the flatten path.
+
+        The FlattenController re-drives from durable state on its next tick, so
+        an error here costs one tick of latency, never the intent — but it must
+        still leave a row.
+        """
+        try:
+            async with self._session_factory() as session:
+                session.add(
+                    EventLog(
+                        source=EventSource.engine.value,
+                        event_type="flatten.error",
+                        portfolio_id=event.portfolio_id,
+                        payload={
+                            "flatten_id": str(event.flatten_id),
+                            "source": event.source,
+                            "reason": event.reason,
+                            "error": repr(exc),
+                        },
+                    )
+                )
+                await session.commit()
+        except Exception:  # noqa: BLE001 — last-ditch; never raise out of the audit path
+            log.exception(
+                "engine.risk.flatten_error_audit_failed", flatten_id=str(event.flatten_id)
+            )
 
     async def _audit_error(self, signal: SignalEvent, exc: Exception) -> None:
         """Record a signal that failed mid-evaluation (broker/DB error) as a

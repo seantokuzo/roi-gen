@@ -50,8 +50,9 @@ from sqlalchemy import delete, func, select
 
 from app.core.logging import get_logger
 from app.engine.execution.apply import apply_snapshot, persist_bracket_legs
+from app.engine.execution.lots import UNAPPLIED_REMAINDER_EVENT, apply_fill_to_lots
 from app.engine.execution.synthesis import applied_ledger, span_price, synthesize_span
-from app.models.enums import EventSource, OrderClass, OrderStatus
+from app.models.enums import EventSource, OrderClass, OrderSide, OrderStatus
 from app.models.telemetry import EquitySnapshot, EventLog
 from app.models.trading import Fill, Order, Position
 
@@ -84,6 +85,15 @@ TERMINAL_STATUSES: frozenset[OrderStatus] = frozenset(
 # not recognize is declared failed after this age — long past any submit
 # latency, short enough that the row can't wedge the reconciler forever.
 _NEVER_SUBMITTED_GRACE = timedelta(seconds=120)
+
+# Companion event types for the parked-remainder retry pass. The event log is
+# append-only (model docstring), so an anomaly's lifecycle is tracked with
+# companion rows referencing its ``id`` — never by mutating its payload.
+_REMAINDER_RESOLVED_EVENT = "lots.unapplied_remainder_resolved"
+_REMAINDER_RETRY_FAILED_EVENT = "lots.unapplied_remainder_retry_failed"
+_REMAINDER_ALERT_EVENT = "lots.unapplied_remainder_alert"
+# A remainder still unapplied after this many reconcile cycles escalates.
+_REMAINDER_ALERT_CYCLES = 3
 
 
 @dataclass(frozen=True, slots=True)
@@ -412,6 +422,12 @@ class ReconciliationService:
             synthesized += await self._sweep_ledger_deficits(
                 session, portfolio_id, adapter, now=now
             )
+            # 4) Parked-remainder retry — AFTER the deficit sweep so lots the
+            # sweep just synthesized (e.g. a flatten's missing entry) are
+            # visible, and still inside the orders phase so the transaction's
+            # lock order stays orders → lots → positions (the trade-updates
+            # writer's order — AB/BA inversion would deadlock).
+            await self._retry_unapplied_remainders(session, portfolio_id)
 
         return updated, orphans, missing, synthesized
 
@@ -516,6 +532,184 @@ class ReconciliationService:
                     )
                 )
         return synthesized
+
+    async def _retry_unapplied_remainders(
+        self, session: AsyncSession, portfolio_id: uuid.UUID
+    ) -> int:
+        """Retry parked strategy-less liquidation remainders (lot overshoot).
+
+        A flatten fill whose qty overran every matched open lot parked the
+        remainder as an ``UNAPPLIED_REMAINDER_EVENT`` anomaly instead of
+        minting a phantom opposite-side lot (:mod:`app.engine.execution.lots`);
+        its Fill row already carries the full qty, so the synthesis cursor is
+        satisfied and only the LOT application is outstanding. By this point
+        in the reconcile the missed-entry synthesis has run, so the lots the
+        fill was racing may now exist — re-apply each open remainder.
+
+        Bookkeeping is append-only companion EventLog rows (anomaly payloads
+        are never mutated — the event log is documented append-only):
+
+        - applied in full → a resolved row referencing the anomaly id;
+        - applied in part → a resolved row PLUS a fresh, smaller anomaly for
+          the residual, so an open anomaly's payload ``qty`` is always exactly
+          what remains to retry (no cross-row arithmetic; the residual's
+          retry-cycle counter restarts — acceptable, since partial progress
+          means lots ARE materializing);
+        - applied not at all → a retry-failed row (cycle N); at cycle
+          ``_REMAINDER_ALERT_CYCLES`` an alert row, once per anomaly. Retries
+          continue after the alert — the missing entry can surface on any
+          later reconcile — and every failed cycle stays on the audit trail.
+
+        Returns the number of anomalies (fully or partially) applied.
+        """
+        anomalies = (
+            (
+                await session.execute(
+                    select(EventLog)
+                    .where(
+                        EventLog.portfolio_id == portfolio_id,
+                        EventLog.event_type == UNAPPLIED_REMAINDER_EVENT,
+                    )
+                    .order_by(EventLog.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        if not anomalies:
+            return 0
+
+        companions = (
+            await session.execute(
+                select(EventLog.event_type, EventLog.payload).where(
+                    EventLog.portfolio_id == portfolio_id,
+                    EventLog.event_type.in_(
+                        (
+                            _REMAINDER_RESOLVED_EVENT,
+                            _REMAINDER_RETRY_FAILED_EVENT,
+                            _REMAINDER_ALERT_EVENT,
+                        )
+                    ),
+                )
+            )
+        ).all()
+        resolved: set[int] = set()
+        failed_cycles: dict[int, int] = {}
+        alerted: set[int] = set()
+        for event_type, companion_payload in companions:
+            ref = companion_payload.get("anomaly_event_id")
+            if ref is None:  # pragma: no cover — companions always carry the ref
+                continue
+            anomaly_id = int(ref)
+            if event_type == _REMAINDER_RESOLVED_EVENT:
+                resolved.add(anomaly_id)
+            elif event_type == _REMAINDER_RETRY_FAILED_EVENT:
+                failed_cycles[anomaly_id] = failed_cycles.get(anomaly_id, 0) + 1
+            else:
+                alerted.add(anomaly_id)
+
+        applied_count = 0
+        for anomaly in anomalies:
+            if anomaly.id in resolved:
+                continue
+            parked = anomaly.payload
+            qty = Decimal(parked["qty"])
+            order_id = uuid.UUID(parked["order_id"]) if parked.get("order_id") else None
+            fill_id = uuid.UUID(parked["fill_id"]) if parked.get("fill_id") else None
+
+            application = await apply_fill_to_lots(
+                session,
+                portfolio_id=portfolio_id,
+                strategy_id=None,
+                symbol=parked["symbol"],
+                side=OrderSide(parked["side"]),
+                qty=qty,
+                price=Decimal(parked["price"]),
+                occurred_at=datetime.fromisoformat(parked["occurred_at"]),
+                order_id=order_id,
+                fill_id=fill_id,
+                record_unapplied=False,  # this pass owns the parked bookkeeping
+            )
+
+            if application.qty_closed > 0:
+                applied_count += 1
+                session.add(
+                    EventLog(
+                        source=EventSource.system.value,
+                        event_type=_REMAINDER_RESOLVED_EVENT,
+                        portfolio_id=portfolio_id,
+                        order_id=order_id,
+                        payload={
+                            "anomaly_event_id": anomaly.id,
+                            "symbol": parked["symbol"],
+                            "applied_qty": str(application.qty_closed),
+                            "realized_pnl": str(application.realized_pnl),
+                            "residual_qty": str(application.unapplied_qty),
+                        },
+                    )
+                )
+                log.warning(
+                    "reconcile.remainder_applied",
+                    portfolio_id=str(portfolio_id),
+                    anomaly_event_id=anomaly.id,
+                    symbol=parked["symbol"],
+                    applied_qty=str(application.qty_closed),
+                    residual_qty=str(application.unapplied_qty),
+                )
+                if application.unapplied_qty > 0:
+                    residual = dict(parked)
+                    residual["qty"] = str(application.unapplied_qty)
+                    residual["superseded_anomaly_event_id"] = anomaly.id
+                    session.add(
+                        EventLog(
+                            source=EventSource.system.value,
+                            event_type=UNAPPLIED_REMAINDER_EVENT,
+                            portfolio_id=portfolio_id,
+                            order_id=order_id,
+                            payload=residual,
+                        )
+                    )
+                continue
+
+            cycle = failed_cycles.get(anomaly.id, 0) + 1
+            session.add(
+                EventLog(
+                    source=EventSource.system.value,
+                    event_type=_REMAINDER_RETRY_FAILED_EVENT,
+                    portfolio_id=portfolio_id,
+                    order_id=order_id,
+                    payload={
+                        "anomaly_event_id": anomaly.id,
+                        "symbol": parked["symbol"],
+                        "qty": str(qty),
+                        "cycle": cycle,
+                    },
+                )
+            )
+            if cycle >= _REMAINDER_ALERT_CYCLES and anomaly.id not in alerted:
+                session.add(
+                    EventLog(
+                        source=EventSource.system.value,
+                        event_type=_REMAINDER_ALERT_EVENT,
+                        portfolio_id=portfolio_id,
+                        order_id=order_id,
+                        payload={
+                            "anomaly_event_id": anomaly.id,
+                            "symbol": parked["symbol"],
+                            "qty": str(qty),
+                            "cycles": cycle,
+                        },
+                    )
+                )
+                log.error(
+                    "reconcile.remainder_alert",
+                    portfolio_id=str(portfolio_id),
+                    anomaly_event_id=anomaly.id,
+                    symbol=parked["symbol"],
+                    qty=str(qty),
+                    cycles=cycle,
+                )
+        return applied_count
 
     @staticmethod
     async def _lookup(adapter: BrokerAdapter, local: Order) -> BrokerOrder | None:

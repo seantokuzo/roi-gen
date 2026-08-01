@@ -8,10 +8,18 @@ from typing import TYPE_CHECKING
 
 from sqlalchemy import select
 
-from app.engine.execution.lots import apply_fill_to_lots
+from app.engine.execution.lots import UNAPPLIED_REMAINDER_EVENT, apply_fill_to_lots
+from app.engine.risk.state import RiskStateProvider
 from app.models.enums import OrderSide
+from app.models.telemetry import EventLog
 from app.models.trading import Lot, LotClose
-from tests.engine.builders import DEFAULT_NOW, seed_lot, seed_portfolio, seed_strategy
+from tests.engine.builders import (
+    DEFAULT_NOW,
+    FakeEngineAdapter,
+    seed_lot,
+    seed_portfolio,
+    seed_strategy,
+)
 
 if TYPE_CHECKING:
     import uuid
@@ -231,8 +239,8 @@ async def test_short_cover_pnl_sign_convention(db_session: AsyncSession, seeded_
 async def test_strategy_scoping_never_bleeds_across_ledgers(
     db_session: AsyncSession, seeded_user: User
 ) -> None:
-    """Strategy B selling SPY must not consume strategy A's lots — and a
-    NULL-strategy (manual) fill is its own scope too."""
+    """Strategy B selling SPY must not consume strategy A's lots. (Strategy-less
+    fills deliberately DO cross scopes — covered by the flatten tests below.)"""
     portfolio = await seed_portfolio(db_session, seeded_user.id)
     strat_a = await seed_strategy(db_session, portfolio.id, name="a")
     strat_b = await seed_strategy(db_session, portfolio.id, name="b")
@@ -245,11 +253,6 @@ async def test_strategy_scoping_never_bleeds_across_ledgers(
     # nothing of A's.
     assert result_b.realized_pnl == Decimal("0")
     assert result_b.opened_lot_id is not None
-
-    result_manual = await _apply(
-        db_session, portfolio.id, None, side=OrderSide.sell, qty="5", price="105"
-    )
-    assert result_manual.realized_pnl == Decimal("0")
 
     a_lots = (
         (await db_session.execute(select(Lot).where(Lot.strategy_id == strat_a.id))).scalars().all()
@@ -302,3 +305,165 @@ async def test_fifo_tiebreak_is_deterministic_on_equal_opened_at(
     await db_session.flush()  # refresh() discards unflushed mutations otherwise
     await db_session.refresh(first)
     assert first.qty_open == Decimal("0")
+
+
+# ── Strategy-less (flatten liquidation) fills ────────────────────────
+
+
+async def test_none_strategy_fill_closes_fifo_across_strategies(
+    db_session: AsyncSession, seeded_user: User
+) -> None:
+    """A strategy-less fill liquidates the NET position: it consumes open lots
+    across ALL strategies FIFO by opened_at, and each LotClose is attributed to
+    the CLOSED LOT's strategy — not the fill's NULL parameter."""
+    portfolio = await seed_portfolio(db_session, seeded_user.id)
+    strat_a = await seed_strategy(db_session, portfolio.id, name="a")
+    strat_b = await seed_strategy(db_session, portfolio.id, name="b")
+    await _apply(db_session, portfolio.id, strat_a.id, side=OrderSide.buy, qty="10", price="100")
+    await _apply(
+        db_session,
+        portfolio.id,
+        strat_b.id,
+        side=OrderSide.buy,
+        qty="10",
+        price="110",
+        at_offset_min=1,
+    )
+
+    result = await _apply(
+        db_session, portfolio.id, None, side=OrderSide.sell, qty="15", price="120", at_offset_min=2
+    )
+
+    # A's older lot is fully consumed first, then 5 of B's:
+    # (120−100)×10 + (120−110)×5 = 200 + 50.
+    assert result.realized_pnl == Decimal("250")
+    assert result.qty_closed == Decimal("15")
+    assert result.lots_fully_closed == 1
+    assert result.opened_lot_id is None
+    assert result.unapplied_qty == Decimal("0")
+
+    closes = (await db_session.execute(select(LotClose))).scalars().all()
+    by_strategy = {c.strategy_id: c for c in closes}
+    assert set(by_strategy) == {strat_a.id, strat_b.id}  # never NULL
+    assert by_strategy[strat_a.id].qty == Decimal("10")
+    assert by_strategy[strat_a.id].realized_pnl == Decimal("200")
+    assert by_strategy[strat_b.id].qty == Decimal("5")
+    assert by_strategy[strat_b.id].realized_pnl == Decimal("50")
+
+    remaining = await _open_lots(db_session, portfolio.id)
+    assert len(remaining) == 1
+    assert remaining[0].strategy_id == strat_b.id
+    assert remaining[0].qty_open == Decimal("5")
+
+
+async def test_breaker_sees_flatten_realized_pnl_per_strategy(
+    db_session: AsyncSession, seeded_user: User
+) -> None:
+    """The per-strategy same-day breaker input (day_realized_pnl_strategy reads
+    lot_closes) must see a flatten loss on the strategy whose lots were closed."""
+    portfolio = await seed_portfolio(db_session, seeded_user.id)
+    strat_a = await seed_strategy(db_session, portfolio.id, name="a")
+    strat_b = await seed_strategy(db_session, portfolio.id, name="b")
+    await _apply(db_session, portfolio.id, strat_a.id, side=OrderSide.buy, qty="10", price="100")
+    await _apply(
+        db_session,
+        portfolio.id,
+        strat_b.id,
+        side=OrderSide.buy,
+        qty="10",
+        price="110",
+        at_offset_min=1,
+    )
+    # Flatten at 95: A loses (95−100)×10 = −50; B loses (95−110)×5 = −75.
+    await _apply(
+        db_session, portfolio.id, None, side=OrderSide.sell, qty="15", price="95", at_offset_min=2
+    )
+
+    provider = RiskStateProvider()
+    state_a = await provider.load(
+        db_session,
+        FakeEngineAdapter(),
+        portfolio_id=portfolio.id,
+        strategy_id=strat_a.id,
+        symbol="SPY",
+    )
+    state_b = await provider.load(
+        db_session,
+        FakeEngineAdapter(),
+        portfolio_id=portfolio.id,
+        strategy_id=strat_b.id,
+        symbol="SPY",
+    )
+    assert state_a.day_realized_pnl_strategy == Decimal("-50")
+    assert state_b.day_realized_pnl_strategy == Decimal("-75")
+
+
+async def test_none_strategy_overshoot_parks_remainder_and_never_opens_a_lot(
+    db_session: AsyncSession, seeded_user: User
+) -> None:
+    """A strategy-less fill beyond every matched lot must NOT mint a phantom
+    opposite-side lot — the remainder is parked as an EventLog anomaly."""
+    portfolio, strategy = await _scoped(db_session, seeded_user)
+    await _apply(db_session, portfolio.id, strategy.id, side=OrderSide.buy, qty="100", price="100")
+
+    result = await _apply(
+        db_session, portfolio.id, None, side=OrderSide.sell, qty="150", price="110", at_offset_min=1
+    )
+
+    assert result.qty_closed == Decimal("100")
+    assert result.realized_pnl == Decimal("1000")
+    assert result.opened_lot_id is None
+    assert result.unapplied_qty == Decimal("50")
+
+    lots = (await db_session.execute(select(Lot))).scalars().all()
+    assert len(lots) == 1  # the entry lot only — no phantom short
+    assert lots[0].qty_open == Decimal("0")
+
+    anomaly = (
+        (
+            await db_session.execute(
+                select(EventLog).where(EventLog.event_type == UNAPPLIED_REMAINDER_EVENT)
+            )
+        )
+        .scalars()
+        .one()
+    )
+    assert anomaly.portfolio_id == portfolio.id
+    assert anomaly.payload["symbol"] == "SPY"
+    assert anomaly.payload["side"] == OrderSide.sell.value
+    # Decimal-compare: quantities routed through Numeric columns carry scale.
+    assert Decimal(anomaly.payload["qty"]) == Decimal("50")
+    assert Decimal(anomaly.payload["price"]) == Decimal("110")
+
+
+async def test_strategy_scoped_overshoot_still_opens_a_lot_and_parks_nothing(
+    db_session: AsyncSession, seeded_user: User
+) -> None:
+    """Regression: the cross-through-zero flip is legitimate for strategy-scoped
+    fills — remainder opens a lot, no anomaly row, unapplied_qty stays 0."""
+    portfolio, strategy = await _scoped(db_session, seeded_user)
+    await _apply(db_session, portfolio.id, strategy.id, side=OrderSide.buy, qty="100", price="100")
+
+    result = await _apply(
+        db_session,
+        portfolio.id,
+        strategy.id,
+        side=OrderSide.sell,
+        qty="150",
+        price="110",
+        at_offset_min=1,
+    )
+
+    assert result.qty_closed == Decimal("100")
+    assert result.opened_lot_id is not None
+    assert result.unapplied_qty == Decimal("0")
+    anomalies = (
+        (
+            await db_session.execute(
+                select(EventLog).where(EventLog.event_type == UNAPPLIED_REMAINDER_EVENT)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert anomalies == []

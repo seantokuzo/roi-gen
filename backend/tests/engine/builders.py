@@ -376,13 +376,14 @@ async def seed_strategy(
     risk_per_trade_pct: Decimal | None = None,
     max_positions: int | None = None,
     symbols: Iterable[str] = ("SPY",),
+    params: dict[str, Any] | None = None,
 ) -> StrategyModel:
     strategy = StrategyModel(
         portfolio_id=portfolio_id,
         name=name,
         kind=kind,
         status=status,
-        params={},
+        params=params if params is not None else {},
         symbols=list(symbols),
         risk_per_trade_pct=risk_per_trade_pct,
         max_positions=max_positions,
@@ -461,6 +462,7 @@ async def seed_order(
     qty: Decimal = Decimal("250"),
     filled_qty: Decimal = Decimal("0"),
     parent_order_id: uuid.UUID | None = None,
+    created_at: datetime | None = None,
 ) -> Order:
     order = Order(
         client_order_id=client_order_id
@@ -479,6 +481,8 @@ async def seed_order(
         filled_qty=filled_qty,
         parent_order_id=parent_order_id,
     )
+    if created_at is not None:  # override the server default for day-boundary tests
+        order.created_at = created_at
     session.add(order)
     await session.flush()
     return order

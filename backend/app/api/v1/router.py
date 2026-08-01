@@ -4,6 +4,7 @@ from fastapi import APIRouter
 
 from app.api.v1.endpoints.account import router as account_router
 from app.api.v1.endpoints.auth import router as auth_router
+from app.api.v1.endpoints.engine import router as engine_router
 from app.api.v1.endpoints.portfolios import router as portfolios_router
 
 api_router = APIRouter()
@@ -12,3 +13,4 @@ api_router.include_router(portfolios_router, prefix="/portfolios", tags=["portfo
 # Account-state endpoints carry their own /{portfolio_id}/... suffix under
 # the shared /portfolios prefix (account snapshots, positions, orders, sync).
 api_router.include_router(account_router, prefix="/portfolios", tags=["account"])
+api_router.include_router(engine_router, prefix="/engine", tags=["engine"])

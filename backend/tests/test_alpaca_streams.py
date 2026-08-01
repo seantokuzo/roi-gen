@@ -32,6 +32,7 @@ from app.brokers.alpaca.streams import (
     CHANNEL_TRADE,
     AlpacaMarketDataConsumer,
     AlpacaTradeUpdatesConsumer,
+    feed_health_key,
 )
 from app.brokers.credentials import BrokerCredentials
 from app.brokers.dto import Bar, Quote, Trade, TradeUpdate
@@ -55,14 +56,25 @@ class FakeRedis:
 
     def __init__(self) -> None:
         self.published: list[tuple[str, str]] = []
+        self.setex_calls: list[tuple[str, int, str]] = []
 
     async def publish(self, channel: str, message: str) -> int:
         self.published.append((channel, message))
         return 1
 
+    async def setex(self, name: str, time: int, value: str) -> bool:
+        self.setex_calls.append((name, time, value))
+        return True
+
     def payloads(self, channel: str) -> list[dict[str, Any]]:
         """Decoded JSON payloads published to ``channel`` (in order)."""
         return [json.loads(msg) for ch, msg in self.published if ch == channel]
+
+    def health_statuses(self, key: str) -> list[str]:
+        """The ``status`` of every JSON value SETEX'd to ``key`` (in order)."""
+        return [
+            json.loads(value)["status"] for name, _ttl, value in self.setex_calls if name == key
+        ]
 
 
 class FakeMarketStream:
@@ -646,6 +658,146 @@ async def test_no_feed_stale_while_data_flows() -> None:
     await _join(task)
 
     assert not _has_status(redis, "feed_stale")
+
+
+# ── Feed-health key (level-based, fail-closed) ───────────────────────
+
+HEALTH_KEY = feed_health_key("pf-hk")
+
+
+def _health_consumer(redis: FakeRedis, stream: FakeMarketStream) -> _FakeClockConsumer:
+    """A fake-clock consumer wired with a portfolio id (health key active)."""
+    return _FakeClockConsumer(
+        CREDS,
+        redis,
+        ["AAPL"],
+        stream_factory=lambda creds, feed: stream,
+        staleness_seconds=30,
+        watchdog_poll_seconds=0.005,
+        portfolio_id="pf-hk",
+    )
+
+
+def test_feed_health_key_shape() -> None:
+    assert feed_health_key("pf-hk") == "engine:feed_health:pf-hk"
+
+
+async def test_feed_health_key_written_on_start_with_ttl() -> None:
+    """Boot writes status=ok under TTL 2× the staleness window."""
+    redis = FakeRedis()
+    stream = FakeMarketStream()
+    consumer = _health_consumer(redis, stream)
+
+    task = asyncio.create_task(consumer.start())
+    await _wait_for(lambda: len(redis.setex_calls) >= 1)
+    await consumer.stop()
+    await _join(task)
+
+    name, ttl, value = redis.setex_calls[0]
+    assert name == HEALTH_KEY
+    assert ttl == 60  # 2 × 30s staleness window
+    payload = json.loads(value)
+    assert payload["status"] == "ok"
+    # stamped-at parses as ISO-8601 and is tz-aware (iron law #5).
+    assert datetime.fromisoformat(payload["at"]).tzinfo is not None
+
+
+async def test_feed_health_refreshes_are_throttled() -> None:
+    """A busy feed refreshes the key at most ~1/sec, not once per message."""
+    redis = FakeRedis()
+    stream = FakeMarketStream()
+    consumer = _health_consumer(redis, stream)
+
+    task = asyncio.create_task(consumer.start())
+    await _wait_for(lambda: len(redis.setex_calls) == 1)
+    await _wait_for(lambda: stream.bar_handler is not None)
+
+    # Three messages inside the same fake second → all throttled.
+    for _ in range(3):
+        await stream.bar_handler(fake_bar())
+    assert len(redis.setex_calls) == 1
+
+    # One throttle window later a single refresh lands (whoever writes first —
+    # handler or watchdog — resets the throttle for the other).
+    consumer.fake_time = 1.0
+    await stream.bar_handler(fake_bar())
+    assert len(redis.setex_calls) == 2
+    assert redis.health_statuses(HEALTH_KEY) == ["ok", "ok"]
+
+    await consumer.stop()
+    await _join(task)
+
+
+async def test_watchdog_refreshes_health_key_while_quiet_but_healthy() -> None:
+    """No data flowing yet not stale: the WATCHDOG keeps the key alive, so
+    key absence means watchdog-dead — never mere feed quiet."""
+    redis = FakeRedis()
+    stream = FakeMarketStream()  # empty feed: no messages at all
+    consumer = _health_consumer(redis, stream)
+
+    task = asyncio.create_task(consumer.start())
+    await _wait_for(lambda: len(redis.setex_calls) >= 1)
+    consumer.fake_time = 10.0  # quiet but inside the 30s window
+    await _wait_for(lambda: len(redis.setex_calls) >= 2)
+    await consumer.stop()
+    await _join(task)
+
+    assert redis.health_statuses(HEALTH_KEY)[-1] == "ok"
+
+
+async def test_never_received_data_goes_stale_and_key_flips() -> None:
+    """A boot that never receives a single message must go stale one window
+    later — feed_stale published AND the level key flipped to stale."""
+    redis = FakeRedis()
+    stream = FakeMarketStream()  # empty feed forever
+    consumer = _health_consumer(redis, stream)
+
+    task = asyncio.create_task(consumer.start())
+    await _wait_for(lambda: consumer._last_msg_at is not None)  # type: ignore[attr-defined]
+    consumer.fake_time = 31.0
+    await _wait_for(lambda: "stale" in redis.health_statuses(HEALTH_KEY))
+    await consumer.stop()
+    await _join(task)
+
+    assert _has_status(redis, "feed_stale")
+    statuses = redis.health_statuses(HEALTH_KEY)
+    assert statuses[0] == "ok"  # boot seed
+    assert statuses[-1] == "stale"  # transition forced through the throttle
+
+
+async def test_feed_health_key_flips_back_to_ok_on_recovery() -> None:
+    """Data resuming after stale forces an immediate ok write (no throttle lag)."""
+    redis = FakeRedis()
+    stream = FakeMarketStream()
+    consumer = _health_consumer(redis, stream)
+
+    task = asyncio.create_task(consumer.start())
+    await _wait_for(lambda: stream.bar_handler is not None)
+    consumer.fake_time = 31.0
+    await _wait_for(lambda: "stale" in redis.health_statuses(HEALTH_KEY))
+
+    # Recover INSIDE the throttle window of the stale write: the ok→stale→ok
+    # transition must bypass the throttle.
+    consumer.fake_time = 31.5
+    await stream.bar_handler(fake_bar())
+    assert redis.health_statuses(HEALTH_KEY)[-1] == "ok"
+
+    await consumer.stop()
+    await _join(task)
+
+    assert _has_status(redis, "feed_ok")
+
+
+async def test_no_feed_health_key_without_portfolio_id() -> None:
+    """Default (no portfolio id, the observation shell): pub/sub only, no key."""
+    redis = FakeRedis()
+    stream = FakeMarketStream()
+    stream.feed = [("bar", fake_bar())]
+    consumer = _md_consumer(redis, stream, staleness_seconds=1000)
+
+    await _run_until_idle(consumer)
+
+    assert redis.setex_calls == []
 
 
 # ── Lifecycle ────────────────────────────────────────────────────────

@@ -28,8 +28,10 @@ from app.brokers.dto import OrderRequest
 from app.brokers.errors import (
     AmbiguousOrderState,
     BrokerAuthError,
+    BrokerError,
     BrokerRateLimited,
     BrokerUnavailable,
+    OrderRefused,
     OrderRejected,
 )
 from app.brokers.ratelimit import AsyncTokenBucket
@@ -373,12 +375,26 @@ async def test_get_calendar_localizes_eastern_walltime() -> None:
     # June 23 is EDT (-04:00): 09:30 ET == 13:30 UTC, 16:00 ET == 20:00 UTC.
     summer = days[0]
     assert summer.trading_date == date(2026, 6, 23)
-    assert summer.session_open == datetime(2026, 6, 23, 13, 30, tzinfo=UTC)
-    assert summer.session_close == datetime(2026, 6, 23, 20, 0, tzinfo=UTC)
+    assert summer.rth_open == datetime(2026, 6, 23, 13, 30, tzinfo=UTC)
+    assert summer.rth_close == datetime(2026, 6, 23, 20, 0, tzinfo=UTC)
     # Nov 27 is EST (-05:00): 09:30 ET == 14:30 UTC, early close 13:00 == 18:00.
     autumn = days[1]
-    assert autumn.session_open == datetime(2026, 11, 27, 14, 30, tzinfo=UTC)
-    assert autumn.session_close == datetime(2026, 11, 27, 18, 0, tzinfo=UTC)
+    assert autumn.rth_open == datetime(2026, 11, 27, 14, 30, tzinfo=UTC)
+    assert autumn.rth_close == datetime(2026, 11, 27, 18, 0, tzinfo=UTC)
+    await adapter.aclose()
+
+
+async def test_get_calendar_rejects_colonless_extended_session_format() -> None:
+    """The no-colon '0400' shape is the EXTENDED-session format — parsing it as
+    RTH would silently shift the close (a 19:55 flatten). Must raise loudly."""
+    calendar_body = [{"date": "2026-06-23", "open": "0400", "close": "2000"}]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _json(calendar_body)
+
+    adapter = _adapter(handler)
+    with pytest.raises(BrokerError, match="HH:MM"):
+        await adapter.get_calendar(date(2026, 6, 23), date(2026, 6, 23))
     await adapter.aclose()
 
 
@@ -416,6 +432,7 @@ async def test_submit_market_order_body() -> None:
     assert "notional" not in body
     assert "take_profit" not in body
     assert "stop_loss" not in body
+    assert "position_intent" not in body  # only serialized when set
     assert order.status is OrderStatus.accepted
     await adapter.aclose()
 
@@ -528,6 +545,31 @@ async def test_submit_trailing_stop_body() -> None:
     await adapter.aclose()
 
 
+async def test_submit_position_intent_serialized() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json_body(request)
+        return _json(_order_payload(side="sell", status="accepted"))
+
+    adapter = _adapter(handler)
+    req = OrderRequest(
+        client_order_id="cid-close",
+        symbol="AAPL",
+        side=OrderSide.sell,
+        order_type=OrderType.market,
+        time_in_force=TimeInForce.day,
+        qty=Decimal("10"),
+        position_intent="sell_to_close",
+    )
+    await adapter.submit_order(req)
+
+    body = captured["body"]
+    # *_to_close rides the wire so a qty race cannot flip the position.
+    assert body["position_intent"] == "sell_to_close"
+    await adapter.aclose()
+
+
 # ── Error taxonomy ────────────────────────────────────────────────────
 
 
@@ -583,6 +625,115 @@ async def test_auth_401_raises_broker_auth_error() -> None:
 async def test_auth_403_raises_broker_auth_error() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return _json({"message": "forbidden"}, status_code=403)
+
+    adapter = _adapter(handler)
+    with pytest.raises(BrokerAuthError):
+        await adapter.get_account()
+    await adapter.aclose()
+
+
+# Alpaca reuses 403 for ORDER-level refusals (held qty / buying power / wash
+# trade). Those must never masquerade as auth failures — and vice versa.
+
+
+def _market_sell(cid: str) -> OrderRequest:
+    return OrderRequest(
+        client_order_id=cid,
+        symbol="AAPL",
+        side=OrderSide.sell,
+        order_type=OrderType.market,
+        time_in_force=TimeInForce.day,
+        qty=Decimal("10"),
+    )
+
+
+async def test_submit_403_held_qty_raises_order_rejected_retryable() -> None:
+    """The bracket-leg cancel/close race: shares held by protective legs. The
+    ONE rejection a flatten may retry once the legs confirm canceled."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _json(
+            {
+                "code": 40310000,
+                "message": "insufficient qty available for order (requested: 10, available: 0)",
+            },
+            status_code=403,
+        )
+
+    adapter = _adapter(handler)
+    with pytest.raises(OrderRejected) as exc_info:
+        await adapter.submit_order(_market_sell("cid-held"))
+    assert exc_info.value.status_code == 403
+    assert exc_info.value.retryable_held_qty is True
+    await adapter.aclose()
+
+
+async def test_submit_403_insufficient_buying_power_rejected_not_retryable() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _json({"code": 40310000, "message": "insufficient buying power"}, status_code=403)
+
+    adapter = _adapter(handler)
+    with pytest.raises(OrderRejected) as exc_info:
+        await adapter.submit_order(_market_sell("cid-bp"))
+    assert exc_info.value.status_code == 403
+    assert exc_info.value.retryable_held_qty is False
+    await adapter.aclose()
+
+
+async def test_submit_403_wash_trade_rejected_by_message_alone() -> None:
+    # No code field: the message-pattern branch must classify it order-level.
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _json(
+            {"message": "potential wash trade detected. use complex orders"}, status_code=403
+        )
+
+    adapter = _adapter(handler)
+    with pytest.raises(OrderRejected) as exc_info:
+        await adapter.submit_order(_market_sell("cid-wash"))
+    assert exc_info.value.retryable_held_qty is False
+    await adapter.aclose()
+
+
+async def test_nonsubmit_403_held_qty_raises_order_refused() -> None:
+    """The same held-qty 403 on a NON-submit mutation (position close during
+    the bracket-leg race) is OrderRefused — neither auth nor submit-shaped."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v2/positions/AAPL"
+        return _json(
+            {
+                "code": 40310000,
+                "message": "insufficient qty available for order (requested: 10, available: 0)",
+            },
+            status_code=403,
+        )
+
+    adapter = _adapter(handler)
+    with pytest.raises(OrderRefused) as exc_info:
+        await adapter.close_position("AAPL")
+    assert exc_info.value.status_code == 403
+    assert exc_info.value.retryable_held_qty is True
+    assert not isinstance(exc_info.value, BrokerAuthError | OrderRejected)
+    await adapter.aclose()
+
+
+async def test_submit_403_auth_shaped_stays_auth_error() -> None:
+    """A 403 without an order-level signature is auth even on submit."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _json({"message": "forbidden."}, status_code=403)
+
+    adapter = _adapter(handler)
+    with pytest.raises(BrokerAuthError):
+        await adapter.submit_order(_market_sell("cid-authish"))
+    await adapter.aclose()
+
+
+async def test_403_unparseable_body_stays_auth_error() -> None:
+    """Fail-closed: a 403 body we can't parse must remain an auth error."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(403, text="forbidden")
 
     adapter = _adapter(handler)
     with pytest.raises(BrokerAuthError):

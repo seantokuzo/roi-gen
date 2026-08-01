@@ -26,6 +26,7 @@ Design rules baked in:
 
 from __future__ import annotations
 
+import json as jsonlib
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any
@@ -49,6 +50,7 @@ from app.brokers.errors import (
     BrokerError,
     BrokerRateLimited,
     BrokerUnavailable,
+    OrderRefused,
     OrderRejected,
 )
 from app.brokers.ratelimit import AsyncTokenBucket
@@ -122,7 +124,19 @@ def _et_walltime_to_utc(day: date, hhmm: str) -> datetime:
     and no offset; the offset depends on whether that date is in EDT or EST, so
     we localize against ``America/New_York`` (which resolves DST for the date)
     and then convert to UTC.
+
+    The colon guard is load-bearing: the same payload's ``session_open`` /
+    ``session_close`` (extended session 4:00–20:00) use a no-colon ``"0400"``
+    format, so colonless input means someone wired the WRONG pair — fail
+    loudly instead of silently parsing an extended close into an RTH close.
     """
+    if ":" not in hhmm:
+        msg = (
+            f"expected RTH 'HH:MM' Eastern wall time, got {hhmm!r} — this looks like "
+            "the extended-session ('0400') format; parse only open/close, never "
+            "session_open/session_close"
+        )
+        raise BrokerError(msg)
     hour_str, minute_str = hhmm.split(":")
     local = datetime(
         day.year,
@@ -133,6 +147,38 @@ def _et_walltime_to_utc(day: date, hhmm: str) -> datetime:
         tzinfo=_MARKET_TZ,
     )
     return local.astimezone(UTC)
+
+
+#: Alpaca's order-level 403 error code: "buying power or shares is not
+#: sufficient" (insufficient buying power and the held-qty case share it).
+_INSUFFICIENT_403_CODE = 40310000
+
+
+def _classify_order_403(body: str) -> tuple[bool, bool]:
+    """Classify a 403 body → ``(is_order_level, retryable_held_qty)``.
+
+    Alpaca reuses HTTP 403 for order-level refusals: "insufficient qty
+    available" (shares held by protective legs — the bracket-leg cancel/close
+    race), insufficient buying power (code 40310000), and wash-trade blocks.
+    Only bodies we positively recognize as order-level are split away from
+    auth; an unparseable or unrecognized 403 stays fail-closed as
+    :class:`BrokerAuthError` (bad keys must never masquerade as a retryable
+    order problem).
+    """
+    try:
+        data = jsonlib.loads(body)
+    except jsonlib.JSONDecodeError:
+        return False, False
+    if not isinstance(data, dict):
+        return False, False
+    message = str(data.get("message", "")).lower()
+    if "insufficient qty available" in message:
+        return True, True
+    if data.get("code") == _INSUFFICIENT_403_CODE or "insufficient buying power" in message:
+        return True, False
+    if "wash trade" in message:
+        return True, False
+    return False, False
 
 
 def _enum_or(default: Any, enum_cls: Any, raw: Any) -> Any:
@@ -243,6 +289,24 @@ class AlpacaBrokerAdapter(BrokerAdapter):
 
         body = self._safe_body(response)
         if status in (401, 403):
+            if status == 403:
+                # Alpaca returns some DEFINITIVE order refusals as 403 (held
+                # qty / insufficient buying power / wash trade) — order-level,
+                # not auth: the keys are fine. Anything we can't positively
+                # classify falls through to BrokerAuthError (fail-closed).
+                order_level, held_qty = _classify_order_403(body)
+                if order_level and is_submit:
+                    raise OrderRejected(
+                        f"alpaca rejected order ({status}): {body}",
+                        status_code=status,
+                        retryable_held_qty=held_qty,
+                    )
+                if order_level:
+                    raise OrderRefused(
+                        f"alpaca refused order operation ({status}): {body}",
+                        status_code=status,
+                        retryable_held_qty=held_qty,
+                    )
             raise BrokerAuthError(f"alpaca auth rejected ({status}): {body}", status_code=status)
         if status == 429:
             raise BrokerRateLimited(
@@ -296,11 +360,15 @@ class AlpacaBrokerAdapter(BrokerAdapter):
         days: list[CalendarDay] = []
         for row in rows:
             trading_date = date.fromisoformat(str(row["date"]))
+            # The payload carries BOTH open/close (RTH, "09:30" colon format)
+            # and session_open/session_close (extended session, "0400" no-colon
+            # format). We want RTH — read ONLY open/close; the colon guard in
+            # _et_walltime_to_utc catches a wrong-pair regression loudly.
             days.append(
                 CalendarDay(
                     trading_date=trading_date,
-                    session_open=_et_walltime_to_utc(trading_date, str(row["open"])),
-                    session_close=_et_walltime_to_utc(trading_date, str(row["close"])),
+                    rth_open=_et_walltime_to_utc(trading_date, str(row["open"])),
+                    rth_close=_et_walltime_to_utc(trading_date, str(row["close"])),
                 )
             )
         return days
@@ -558,6 +626,10 @@ def _build_order_body(req: OrderRequest) -> dict[str, Any]:
         body["stop_price"] = str(req.stop_price)
     if req.trail_percent is not None:
         body["trail_percent"] = str(req.trail_percent)
+    if req.position_intent is not None:
+        # Explicit open/close intent: liquidations submit *_to_close so a qty
+        # race cannot flip the position through zero into the opposite side.
+        body["position_intent"] = req.position_intent
 
     # Protective legs for bracket/OTO/OCO. take_profit needs a limit_price;
     # stop_loss needs a stop_price and optionally a limit_price (stop-limit exit).

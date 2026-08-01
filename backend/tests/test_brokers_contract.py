@@ -174,6 +174,17 @@ def test_order_request_simple_extended_hours_allowed() -> None:
     assert req.extended_hours is True
 
 
+def test_order_request_position_intent_optional_and_validated() -> None:
+    # Unset by default (no behavior change for existing callers)...
+    assert OrderRequest(**_base_request()).position_intent is None  # type: ignore[arg-type]
+    # ...accepts the four broker intents...
+    req = OrderRequest(**_base_request(position_intent="sell_to_close"))  # type: ignore[arg-type]
+    assert req.position_intent == "sell_to_close"
+    # ...and rejects anything outside the Literal.
+    with pytest.raises(ValidationError):
+        OrderRequest(**_base_request(position_intent="close_it"))  # type: ignore[arg-type]
+
+
 # ── Decimal fidelity ─────────────────────────────────────────────────
 
 
@@ -386,8 +397,8 @@ def test_broker_credentials_is_frozen() -> None:
 def test_calendar_day_constructs() -> None:
     day = CalendarDay(
         trading_date=date(2026, 6, 23),
-        session_open=datetime(2026, 6, 23, 13, 30, tzinfo=UTC),
-        session_close=datetime(2026, 6, 23, 20, 0, tzinfo=UTC),
+        rth_open=datetime(2026, 6, 23, 13, 30, tzinfo=UTC),
+        rth_close=datetime(2026, 6, 23, 20, 0, tzinfo=UTC),
     )
     assert day.trading_date == date(2026, 6, 23)
-    assert day.session_open.tzinfo is UTC
+    assert day.rth_open.tzinfo is UTC

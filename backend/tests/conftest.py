@@ -65,17 +65,34 @@ async def _ensure_test_database(test_url: str) -> None:
 
 
 @pytest_asyncio.fixture(scope="session", loop_scope="session")
-async def test_db_url() -> str:
-    """Create the test database (if needed) and migrate it to head."""
+async def test_db_url() -> AsyncGenerator[str, None]:
+    """Create the test database (if needed), migrate to head — and SERIALIZE.
+
+    The suite shares one ``*_test`` database and truncates tables per test;
+    two concurrent pytest runs (routine now that multi-agent local review is
+    the project protocol) corrupt each other — observed live: one run's
+    ``TRUNCATE ... RESTART IDENTITY`` blocking on the sibling's transaction,
+    seq-sensitive tests failing on rows the sibling reset. A session-held
+    Postgres advisory lock makes the second runner WAIT instead.
+    """
     test_url = _test_database_url()
     await _ensure_test_database(test_url)
 
-    cfg = Config(str(_BACKEND_DIR / "alembic.ini"))
-    cfg.set_main_option("sqlalchemy.url", test_url)
-    # alembic's command API is sync (env.py calls asyncio.run internally),
-    # so run it in a worker thread with its own event loop.
-    await asyncio.to_thread(command.upgrade, cfg, "head")
-    return test_url
+    lock_engine = create_async_engine(test_url, poolclass=NullPool)
+    lock_conn = await lock_engine.connect()
+    await lock_conn.execute(text("SELECT pg_advisory_lock(hashtext('roigen-test-suite'))"))
+    await lock_conn.rollback()  # session lock survives; avoid idle-in-transaction
+
+    try:
+        cfg = Config(str(_BACKEND_DIR / "alembic.ini"))
+        cfg.set_main_option("sqlalchemy.url", test_url)
+        # alembic's command API is sync (env.py calls asyncio.run internally),
+        # so run it in a worker thread with its own event loop.
+        await asyncio.to_thread(command.upgrade, cfg, "head")
+        yield test_url
+    finally:
+        await lock_conn.close()
+        await lock_engine.dispose()
 
 
 @pytest_asyncio.fixture

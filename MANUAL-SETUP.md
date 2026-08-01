@@ -10,14 +10,36 @@
 - [ ] ♻️ **Finnhub + FRED keys** — carry over (earnings calendar, macro events).
 - [ ] ♻️ **Google OAuth client** — carry over (`GOOGLE_CLIENT_ID`/`GOOGLE_CLIENT_SECRET`, `ALLOWED_EMAIL=seantokuzo@gmail.com`). If the OAuth consent screen lists allowed origins, add the new app's URL(s) (`http://localhost:4300` once the frontend lands).
 - [ ] **GitHub repo plumbing** for https://github.com/seantokuzo/roi-gen:
-  - [ ] Install the **Claude GitHub App** on the repo (https://github.com/apps/claude) — needed for the auto-review loop.
-  - [ ] **PR auto-review on your Max subscription (NOT metered API billing):**
-    1. Locally run `claude setup-token` → opens a browser, logs into your Max account, prints a one-year token (`sk-ant-oat01-…`). Copy it immediately (it's not saved anywhere).
-    2. GitHub → repo Settings → Secrets and variables → Actions → New repository secret. Name: `CLAUDE_CODE_OAUTH_TOKEN`. Value: paste the token.
-    3. Done — the review workflow is already wired to use it (`.github/workflows/claude-code-review.yml`). Reviews bill against your Max quota, not the API console. Until the secret exists, the review job just skips (CI stays green).
-    - Token lasts ~1 year; set a reminder to re-run `claude setup-token` and update the secret before it expires.
-    - Caveat: heavy review volume draws from the *same* Max usage cap as your interactive Claude Code sessions. Fine for a solo repo's PR cadence.
+  - ~~Claude GitHub App + `CLAUDE_CODE_OAUTH_TOKEN` secret~~ — **retired 2026-07-09**: PR reviews are local-only now (multi-lens adversarial review + impartial judge, see `CLAUDE.md`); the cloud review workflow was deleted. The secret can be removed from repo settings if it's still there.
   - [ ] Branch protection on `main` (require PR + passing CI) — optional but recommended.
+
+## Live-paper E2E runbook (Phase 2c — the Phase 2 deliverable proof)
+
+Runs the REAL engine as a subprocess against the REAL Alpaca paper API: probe
+strategy enters a bracket off a live bar → kill-switch `flatten` via the real
+CLI → broker-verified flat → full audit chain asserted from rows. Never runs in
+CI; deselected from plain `pytest` by marker.
+
+Preconditions (all local):
+- Postgres up (compose `db` or the brew fallback) — the suite creates/migrates its own `*_test` DB.
+- Redis up. The test uses DB index 9 by default (`ROIGEN_LIVE_REDIS_URL` to override).
+- Paper keys in the environment (`ALPACA_API_KEY`/`ALPACA_SECRET_KEY`) — use the **`roi-gen-dev` paper account, and treat it as ENGINE-ONLY**: the flatten controller cancels/closes EVERYTHING in the account, including anything you placed by hand, and the test skips if the account isn't flat.
+- Market open, with ≥20 minutes before the close (entries are risk-blocked inside the flatten buffer).
+- No other engine running against that account (a second market-data socket 406s; the advisory lock also blocks a same-DB second engine).
+
+Run:
+
+```bash
+cd backend
+ROIGEN_LIVE_E2E=1 uv run pytest -m live_paper tests/live/ -q -s
+```
+
+Expected: one test, ~2–6 minutes (dominated by waiting for the first 1-minute
+bar). On failure the engine subprocess's log tail is printed for forensics.
+What paper proves: plumbing + audit trail (order flow, stream writer, FIFO
+lots, command lifecycle, flatten completion). What it can't prove: fill
+realism (paper fills are optimistic NBBO — the Phase-3+ slippage haircut
+exists for that).
 
 ## Before Phase 9 (going live with real money)
 

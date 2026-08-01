@@ -33,6 +33,12 @@ python_version = "3.12"
 asyncio_mode = "auto"
 testpaths = ["tests"]
 pythonpath = ["."]
+markers = [
+    "live_paper: hits the real Alpaca paper API; runs only with ROIGEN_LIVE_E2E=1 + paper keys, during RTH, never in CI",
+]
+# The live suite self-skips without its env gate, but excluding it by default
+# keeps `pytest` fast and network-free; run it explicitly (see MANUAL-SETUP.md).
+addopts = "-m 'not live_paper'"
 
 [dependency-groups]
 dev = [

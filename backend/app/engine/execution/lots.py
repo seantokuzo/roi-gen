@@ -10,10 +10,26 @@ both (a cross-through-zero flip). Two artifacts are written per consumption:
   same-day risk queries read, because the lot accumulator alone hides a
   partial-close loss until the lot fully closes.
 
-Scoping: FIFO matching is per ``(portfolio_id, symbol, strategy_id)``. Two
-strategies may hold the same symbol (the broker nets per account; lots are the
-per-strategy analytical ledger), and P&L attribution must never bleed across
-strategies. A NULL ``strategy_id`` (manual / unattributed) is its own scope.
+Scoping: FIFO matching is per ``(portfolio_id, symbol, strategy_id)`` for
+strategy-scoped fills. Two strategies may hold the same symbol (the broker
+nets per account; lots are the per-strategy analytical ledger), and P&L
+attribution must never bleed across strategies.
+
+A **strategy-less fill** (``strategy_id=None`` — flatten liquidations; the
+provenance marker is the ``roigen-flatten-`` client-id prefix, never
+``strategy_id IS NULL``) is different: the broker liquidates the NET account
+position, so the fill matches open lots across ALL strategies in
+``(portfolio_id, symbol)``, FIFO by ``opened_at``. Each ``LotClose`` carries
+the **closed lot's** ``strategy_id`` so flatten-realized P&L lands on the
+right strategy's same-day breaker. Overshoot rule: a strategy-less fill's
+remainder beyond every matched open lot NEVER opens a lot — the broker sized
+the liquidation, so overshoot is always ledger divergence (a missing entry
+we haven't recorded yet), not a real short. The remainder is parked as an
+:class:`~app.models.telemetry.EventLog` anomaly
+(:data:`UNAPPLIED_REMAINDER_EVENT`) and retried by the periodic reconcile
+(:mod:`app.services.reconciliation`). Strategy-scoped remainders still open a
+new lot (legitimate short-entry / cross-through-zero flow); NULL-strategy
+LOTS stay reserved for manual/unattributed entries.
 
 Sign conventions: long lots are buys, short lots are sells (``Lot.side`` stores
 the :class:`~app.models.enums.OrderSide` value). Realized P&L on a long close is
@@ -35,7 +51,8 @@ from typing import TYPE_CHECKING
 from sqlalchemy import select
 
 from app.core.logging import get_logger
-from app.models.enums import OrderSide
+from app.models.enums import EventSource, OrderSide
+from app.models.telemetry import EventLog
 from app.models.trading import Lot, LotClose
 
 if TYPE_CHECKING:
@@ -44,6 +61,10 @@ if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
 log = get_logger("engine.lots")
+
+# The parked-remainder anomaly (see module docstring). Written here; read and
+# retried by the reconciliation service's parked-remainder pass.
+UNAPPLIED_REMAINDER_EVENT = "lots.unapplied_liquidation_remainder"
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,6 +75,9 @@ class LotApplication:
     qty_closed: Decimal
     lots_fully_closed: int
     opened_lot_id: uuid.UUID | None
+    # Strategy-less overshoot only: quantity that matched no open lot and was
+    # parked (never opens a lot). Always 0 for strategy-scoped fills.
+    unapplied_qty: Decimal = Decimal("0")
 
 
 async def apply_fill_to_lots(
@@ -68,32 +92,57 @@ async def apply_fill_to_lots(
     occurred_at: datetime,
     order_id: uuid.UUID | None = None,
     fill_id: uuid.UUID | None = None,
+    record_unapplied: bool = True,
 ) -> LotApplication:
     """Apply one fill FIFO against the ``(portfolio, symbol, strategy)`` lots.
 
     Consumes open opposite-side lots first (booking a ``LotClose`` per
-    consumption); any remainder opens a new same-side lot. Rows are staged on
+    consumption); a strategy-scoped remainder opens a new same-side lot, a
+    strategy-less remainder is parked (module docstring). Rows are staged on
     ``session``; the caller owns the transaction and must already hold whatever
     serialization it needs (the writers lock the Order row).
+
+    ``record_unapplied=False`` suppresses the parked-remainder EventLog row
+    ONLY — for the reconcile retry pass, which re-applies an already-parked
+    remainder and owns its own resolve/supersede bookkeeping (a fresh anomaly
+    row from in here would double-park the same quantity). Every other caller
+    leaves it True.
     """
     opposite = OrderSide.sell if side is OrderSide.buy else OrderSide.buy
+    # Strategy-scoped fills match their own ledger; strategy-less fills
+    # (flatten liquidations of the NET broker position) match every
+    # strategy's lots in (portfolio, symbol) — the old NULL-scope-only match
+    # would close nothing and mint a phantom opposite-side lot.
+    conditions = [
+        Lot.portfolio_id == portfolio_id,
+        Lot.symbol == symbol,
+        Lot.side == opposite.value,
+        Lot.qty_open > 0,
+    ]
+    if strategy_id is not None:
+        conditions.append(Lot.strategy_id == strategy_id)
+    else:
+        # Time bound (review-critical): a liquidation can only close exposure
+        # that existed when it PRINTED. Without this, the reconcile retry pass
+        # replaying a parked remainder days later would consume freshly-opened
+        # unrelated lots — a phantom LotClose feeding the wrong strategy's
+        # same-day breaker, then a phantom short when the real exit arrives.
+        # A remainder that never finds a time-eligible lot stays parked and
+        # alerting, which is honest; consuming the future is corruption.
+        conditions.append(Lot.opened_at <= occurred_at)
     # FOR UPDATE: the Order-row locks writers hold only serialize fills of the
     # SAME order — two writers filling DIFFERENT orders in this same
     # (portfolio, strategy, symbol) scope (live writer vs periodic-reconcile
     # synthesis) would otherwise read-modify-write the same lot concurrently
     # and double-book realized P&L. The deterministic ORDER BY keeps lock
-    # acquisition order consistent across writers (no deadlock by ordering).
+    # acquisition order consistent across writers (no deadlock by ordering) —
+    # the strategy-less widened set locks a superset of rows in the SAME
+    # global order, so it composes with strategy-scoped writers too.
     open_lots = (
         (
             await session.execute(
                 select(Lot)
-                .where(
-                    Lot.portfolio_id == portfolio_id,
-                    Lot.strategy_id == strategy_id,
-                    Lot.symbol == symbol,
-                    Lot.side == opposite.value,
-                    Lot.qty_open > 0,
-                )
+                .where(*conditions)
                 .order_by(Lot.opened_at, Lot.created_at, Lot.id)
                 .with_for_update()
                 .execution_options(populate_existing=True)
@@ -131,7 +180,12 @@ async def apply_fill_to_lots(
                 order_id=order_id,
                 fill_id=fill_id,
                 portfolio_id=portfolio_id,
-                strategy_id=strategy_id,
+                # The CLOSED LOT's strategy, never the fill's parameter: a
+                # strategy-less liquidation fill would otherwise stamp NULL
+                # and hide the realized loss from that strategy's same-day
+                # breaker. (Lot.realized_pnl/closed_at above need no such
+                # treatment — they live on the lot row itself.)
+                strategy_id=lot.strategy_id,
                 symbol=symbol,
                 qty=consumed,
                 realized_pnl=pnl,
@@ -144,21 +198,56 @@ async def apply_fill_to_lots(
         remaining -= consumed
 
     opened_lot_id: uuid.UUID | None = None
+    unapplied = Decimal("0")
     if remaining > 0:
-        new_lot = Lot(
-            portfolio_id=portfolio_id,
-            strategy_id=strategy_id,
-            symbol=symbol,
-            side=side.value,
-            qty_orig=remaining,
-            qty_open=remaining,
-            entry_price=price,
-            entry_fill_id=fill_id,
-            opened_at=occurred_at,
-        )
-        session.add(new_lot)
-        await session.flush()
-        opened_lot_id = new_lot.id
+        if strategy_id is None:
+            # Overshoot rule: NEVER open a lot from a strategy-less remainder.
+            # Park it; the periodic reconcile retries it against lots that
+            # appear later (e.g. a synthesized missing entry).
+            unapplied = remaining
+            log.warning(
+                "engine.lots.unapplied_remainder",
+                symbol=symbol,
+                side=side.value,
+                qty=str(remaining),
+                price=str(price),
+                order_id=str(order_id) if order_id else None,
+                fill_id=str(fill_id) if fill_id else None,
+            )
+            if record_unapplied:
+                session.add(
+                    EventLog(
+                        source=EventSource.engine.value,
+                        event_type=UNAPPLIED_REMAINDER_EVENT,
+                        portfolio_id=portfolio_id,
+                        order_id=order_id,
+                        payload={
+                            "portfolio_id": str(portfolio_id),
+                            "symbol": symbol,
+                            "side": side.value,
+                            "qty": str(remaining),
+                            "price": str(price),
+                            "occurred_at": occurred_at.isoformat(),
+                            "order_id": str(order_id) if order_id else None,
+                            "fill_id": str(fill_id) if fill_id else None,
+                        },
+                    )
+                )
+        else:
+            new_lot = Lot(
+                portfolio_id=portfolio_id,
+                strategy_id=strategy_id,
+                symbol=symbol,
+                side=side.value,
+                qty_orig=remaining,
+                qty_open=remaining,
+                entry_price=price,
+                entry_fill_id=fill_id,
+                opened_at=occurred_at,
+            )
+            session.add(new_lot)
+            await session.flush()
+            opened_lot_id = new_lot.id
 
     log.debug(
         "engine.lots.applied",
@@ -168,11 +257,13 @@ async def apply_fill_to_lots(
         price=str(price),
         realized=str(realized),
         closed=str(qty_closed),
-        opened=str(remaining) if remaining > 0 else None,
+        opened=str(remaining) if opened_lot_id is not None else None,
+        unapplied=str(unapplied) if unapplied > 0 else None,
     )
     return LotApplication(
         realized_pnl=realized,
         qty_closed=qty_closed,
         lots_fully_closed=fully_closed,
         opened_lot_id=opened_lot_id,
+        unapplied_qty=unapplied,
     )
