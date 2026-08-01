@@ -588,17 +588,28 @@ class AlpacaMarketDataConsumer(_SupervisedStreamConsumer):
                 self._last_msg_at = self._now()
                 continue
             stale = (self._now() - last) >= self._staleness_seconds
-            if stale and not self._feed_stale:
-                self._feed_stale = True
-                log.error(
-                    "alpaca.feed.stale",
-                    seconds_since_data=self._now() - last,
-                    threshold=self._staleness_seconds,
-                    symbols=self._symbols,
-                )
-                await self._publish_feed_status("feed_stale")
-                await self._write_feed_health("stale", force=True)
-            elif not stale:
+            if stale:
+                transition = not self._feed_stale
+                if transition:
+                    self._feed_stale = True
+                    log.error(
+                        "alpaca.feed.stale",
+                        seconds_since_data=self._now() - last,
+                        threshold=self._staleness_seconds,
+                        symbols=self._symbols,
+                    )
+                    # Log + pub/sub stay EDGE-triggered: an outage should not
+                    # spam the operator's log or the status channel.
+                    await self._publish_feed_status("feed_stale")
+                # ...but the health KEY write is level-triggered, like the "ok"
+                # path below. Writes are swallowed best-effort (a Redis hiccup
+                # must never kill the feed), so a failed "stale" write needs
+                # another chance — edge-triggering it meant one dropped write
+                # left the key holding its last "ok" for the rest of the
+                # blackout. The reader's freshness check would still catch it,
+                # but the key itself would be lying to everything else.
+                await self._write_feed_health("stale", force=transition)
+            else:
                 await self._write_feed_health("ok")
 
     async def _publish_feed_status(self, status: str) -> None:

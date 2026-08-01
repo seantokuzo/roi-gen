@@ -1019,3 +1019,60 @@ def test_watchdog_poll_tracks_the_effective_window() -> None:
     consumer = _floor_consumer(staleness_seconds=10)
     assert consumer._staleness_seconds == 120.0  # noqa: SLF001
     assert consumer._watchdog_poll == 5.0  # noqa: SLF001
+
+
+async def test_a_failed_stale_health_write_is_retried_on_the_next_tick() -> None:
+    """The blackout marker must survive a dropped write.
+
+    Health writes are swallowed best-effort so a Redis hiccup can't kill the
+    feed — which means the ok→stale write cannot be edge-triggered: one
+    dropped write would leave the key holding its last "ok" for the rest of
+    the blackout, lying to every reader of that key. (The reader's freshness
+    check is the second line of defense; this is the first.)
+    """
+
+    class StaleWriteFailsOnce(FakeRedis):
+        def __init__(self) -> None:
+            super().__init__()
+            self.stale_attempts = 0
+
+        async def setex(self, name: str, time: int, value: str) -> bool:
+            if json.loads(value)["status"] == "stale":
+                self.stale_attempts += 1
+                if self.stale_attempts == 1:
+                    msg = "Timeout connecting to server"
+                    raise TimeoutError(msg)
+            return await super().setex(name, time, value)
+
+    redis = StaleWriteFailsOnce()
+    stream = FakeMarketStream()
+    consumer = _FakeClockConsumer(
+        CREDS,
+        redis,
+        ["AAPL"],
+        stream_factory=lambda creds, feed: stream,
+        subscribe_trades=True,  # continuous channel: a 30s window is honest here
+        staleness_seconds=30,
+        watchdog_poll_seconds=0.005,
+        portfolio_id="pf-hk",
+    )
+
+    task = asyncio.create_task(consumer.start())
+    await _wait_for(lambda: stream.bar_handler is not None)
+
+    # Cross the threshold; the first "stale" write raises and is swallowed.
+    consumer.fake_time = 40.0
+    await _wait_for(lambda: redis.stale_attempts >= 1)
+
+    # Keep ticking with the clock advancing so the 1s refresh throttle can
+    # never be the reason a retry didn't happen.
+    for moment in (41.0, 42.0, 43.0):
+        consumer.fake_time = moment
+        await _wait_for(lambda: redis.stale_attempts >= 2, timeout=1.0)
+
+    await consumer.stop()
+    await _join(task)
+
+    assert redis.stale_attempts >= 2, "the failed stale write was never retried"
+    statuses = redis.health_statuses(HEALTH_KEY)
+    assert statuses[-1] == "stale", f"key still advertises {statuses[-1]!r} during a blackout"
