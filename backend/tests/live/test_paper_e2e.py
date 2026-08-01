@@ -112,7 +112,11 @@ class _EngineProc:
             with contextlib.suppress(ProcessLookupError):
                 os.killpg(os.getpgid(self._proc.pid), signal.SIGTERM)
             try:
-                self._proc.wait(timeout=15)
+                # The engine logs `engine.stopped` promptly but the process can
+                # linger ~12s closing websocket TCP sessions; 15s left only ~3s
+                # of margin (dress-rehearsal measurement), and a SIGKILL here
+                # would look like a teardown bug in an otherwise-passing run.
+                self._proc.wait(timeout=45)
             except subprocess.TimeoutExpired:
                 with contextlib.suppress(ProcessLookupError):
                     os.killpg(os.getpgid(self._proc.pid), signal.SIGKILL)

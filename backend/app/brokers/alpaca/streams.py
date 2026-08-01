@@ -94,6 +94,52 @@ _DEFAULT_STALENESS_SECONDS = 30.0
 #: Minimum spacing between throttled feed-health key refreshes: _mark_alive
 #: runs per message, and a busy feed must not turn every tick into a SETEX.
 _FEED_HEALTH_REFRESH_SECONDS = 1.0
+#: Cadence of the slowest channel we can subscribe to. Bars are the coarsest:
+#: one message per symbol per MINUTE. Quotes/trades stream continuously, so
+#: subscribing to either makes sub-minute staleness detection honest.
+_BAR_INTERVAL_SECONDS = 60.0
+#: Safety factor over the slowest subscribed cadence — one missed bar must not
+#: read as an outage.
+_STALENESS_FLOOR_FACTOR = 2.0
+#: Absolute floor regardless of subscriptions: a window of 0 makes every tick
+#: "stale" and wedges entries off permanently.
+_MIN_STALENESS_SECONDS = 5.0
+
+
+def _staleness_floor(requested: float, *, quotes: bool, trades: bool) -> float:
+    """Raise ``requested`` to a threshold the subscribed channels can satisfy.
+
+    A staleness threshold BELOW the natural spacing of the slowest subscribed
+    channel doesn't detect outages — it manufactures them. Bars-only at one
+    message/minute against the 30s default made the gate oscillate
+    ok→stale→ok every single minute on a perfectly healthy feed, blocking
+    entries at random and desensitizing the operator to a signal that fires
+    constantly (found in the Phase-2 dress rehearsal, where it would also have
+    failed the live E2E: the probe emits off the very bar whose arrival the
+    gate hadn't observed yet).
+
+    Continuous channels (quotes/trades) print far faster than a minute, so
+    subscribing to either leaves the caller's number alone — the floor tightens
+    automatically as the subscription set grows, instead of relying on someone
+    remembering to re-tune a constant.
+    """
+    if quotes or trades:
+        # Continuous channels justify a sub-minute window, but not a zero or
+        # negative one: `(now - last) >= 0` is always true, so the watchdog
+        # would flag stale on its first tick and never clear — blocking every
+        # entry for the life of the process. Fails closed, but it's an
+        # availability footgun on the branch we'd use to tighten detection.
+        return max(requested, _MIN_STALENESS_SECONDS)
+    floor = _BAR_INTERVAL_SECONDS * _STALENESS_FLOOR_FACTOR
+    if requested >= floor:
+        return requested
+    log.info(
+        "alpaca.feed.staleness_floor_applied",
+        requested=requested,
+        applied=floor,
+        reason="bars-only subscription: threshold must exceed the bar interval",
+    )
+    return floor
 
 
 # Order-status translation is shared with the REST adapter — one source of
@@ -376,8 +422,8 @@ class AlpacaMarketDataConsumer(_SupervisedStreamConsumer):
     of this consumer alive per account; everything else reads from Redis.
 
     A staleness watchdog publishes a ``feed_stale`` status to
-    ``engine:feed_status`` when no market-data message has arrived for
-    ``staleness_seconds`` (default 30) while the feed is expected live — the
+    ``engine:feed_status`` when no market-data message has arrived for the
+    EFFECTIVE staleness window while the feed is expected live — the
     signal the risk layer uses to block new entries during a feed blackout
     (project gotcha: RTH feed silence ⇒ block entries). It clears with
     ``feed_ok`` as soon as data resumes. Those pub/sub transitions are
@@ -385,6 +431,14 @@ class AlpacaMarketDataConsumer(_SupervisedStreamConsumer):
     consumer ALSO maintains the level-based ``engine:feed_health:{id}`` key
     (see :func:`feed_health_key`) that the engine polls fail-closed —
     key absent ⇒ stale.
+
+    The window is ``staleness_seconds`` raised to a floor the subscribed
+    channels can actually satisfy (see :func:`_staleness_floor`): bars arrive
+    once a MINUTE, so the 30s default alone would flag a healthy bars-only
+    feed stale every minute. Bars-only ⇒ 120s; subscribing quotes or trades
+    (continuous) honours the requested number as-is. Detection latency for a
+    genuine blackout is therefore ~2 min on a bars-only feed — enabling quotes
+    is how you buy it back, and is worth doing before live trading.
     """
 
     def __init__(
@@ -413,28 +467,36 @@ class AlpacaMarketDataConsumer(_SupervisedStreamConsumer):
         self._feed = feed
         self._want_quotes = subscribe_quotes
         self._want_trades = subscribe_trades
-        self._staleness_seconds = staleness_seconds
+        self._staleness_seconds = _staleness_floor(
+            staleness_seconds, quotes=subscribe_quotes, trades=subscribe_trades
+        )
         # Poll a fraction of the window so detection latency is bounded; capped
         # at 5s so a long staleness window still reacts promptly. Injectable so
         # tests can drive it fast.
         self._watchdog_poll = (
             watchdog_poll_seconds
             if watchdog_poll_seconds is not None
-            else min(max(staleness_seconds / 5, 0.01), 5.0)
+            else min(max(self._staleness_seconds / 5, 0.01), 5.0)
         )
         self._stream_factory = stream_factory or _default_market_stream_factory
 
         # Watchdog state.
         self._last_msg_at: float | None = None
         self._feed_stale = False
+        # False until a real message lands: boot must not advertise health it
+        # has not earned (a socket that never connects would otherwise read
+        # healthy for a full window).
+        self._seen_data = False
         self._watchdog_task: asyncio.Task[None] | None = None
 
         # Level-based feed-health key (None → pub/sub transitions only; the
         # engine wires its portfolio id so the fail-closed poller has a key).
         self._feed_health_key = None if portfolio_id is None else feed_health_key(portfolio_id)
-        # TTL 2× the window: a dead watchdog lapses the key within one extra
-        # window, and the reader treats absence as stale.
-        self._feed_health_ttl = max(1, int(staleness_seconds * 2))
+        # TTL 2× the EFFECTIVE window (never the raw request): a TTL shorter
+        # than the staleness threshold would let the key lapse while the feed
+        # is still considered healthy, and the fail-closed reader would call
+        # that an outage — reintroducing the false-stale bug from the other end.
+        self._feed_health_ttl = max(1, int(self._staleness_seconds * 2))
         self._last_health_write = float("-inf")
 
     # -- stream construction --------------------------------------------------
@@ -451,8 +513,16 @@ class AlpacaMarketDataConsumer(_SupervisedStreamConsumer):
     # -- lifecycle (wrap base to run the watchdog alongside) ------------------
 
     async def start(self) -> None:
-        """Start the stream supervisor and the staleness watchdog together."""
-        await self._mark_alive()
+        """Start the stream supervisor and the staleness watchdog together.
+
+        The staleness clock is SEEDED here, but no health is advertised: until
+        a real message lands we have no evidence the feed works, and a socket
+        that never connects at all (bad key, Alpaca down, the 406 one-connection
+        limit) must not read as healthy for a whole window. Key absence already
+        means stale to the reader, which is exactly the right answer here.
+        """
+        self._last_msg_at = self._now()
+        self._reset_backoff()
         self._watchdog_task = asyncio.create_task(self._watchdog_loop())
         try:
             await super().start()
@@ -509,6 +579,7 @@ class AlpacaMarketDataConsumer(_SupervisedStreamConsumer):
         flip bypasses the throttle so the key never lags the transition.
         """
         self._last_msg_at = self._now()
+        self._seen_data = True  # first real evidence the feed works
         self._reset_backoff()
         if self._feed_stale:
             self._feed_stale = False
@@ -538,21 +609,42 @@ class AlpacaMarketDataConsumer(_SupervisedStreamConsumer):
                 self._last_msg_at = self._now()
                 continue
             stale = (self._now() - last) >= self._staleness_seconds
-            if stale and not self._feed_stale:
-                self._feed_stale = True
-                log.error(
-                    "alpaca.feed.stale",
-                    seconds_since_data=self._now() - last,
-                    threshold=self._staleness_seconds,
-                    symbols=self._symbols,
-                )
-                await self._publish_feed_status("feed_stale")
-                await self._write_feed_health("stale", force=True)
-            elif not stale:
+            if stale:
+                transition = not self._feed_stale
+                if transition:
+                    self._feed_stale = True
+                    log.error(
+                        "alpaca.feed.stale",
+                        seconds_since_data=self._now() - last,
+                        threshold=self._staleness_seconds,
+                        symbols=self._symbols,
+                    )
+                    # Log + pub/sub stay EDGE-triggered: an outage should not
+                    # spam the operator's log or the status channel.
+                    await self._publish_feed_status("feed_stale")
+                # ...but the health KEY write is level-triggered, like the "ok"
+                # path below. Writes are swallowed best-effort (a Redis hiccup
+                # must never kill the feed), so a failed "stale" write needs
+                # another chance — edge-triggering it meant one dropped write
+                # left the key holding its last "ok" for the rest of the
+                # blackout. The reader's freshness check would still catch it,
+                # but the key itself would be lying to everything else.
+                await self._write_feed_health("stale", force=transition)
+            elif self._seen_data:
+                # LEVEL-TRIGGERED, and the reader depends on it: `_read_level`
+                # treats an "ok" older than `window_seconds` as stale, which is
+                # only safe because this re-stamps every poll (5s against a
+                # 120s window). Making this edge-triggered would age the key
+                # past the window on a quiet-but-healthy feed and false-trip
+                # the gate — the original bug, re-entered through the reader.
                 await self._write_feed_health("ok")
 
     async def _publish_feed_status(self, status: str) -> None:
-        """Publish a feed status object to ``engine:feed_status``."""
+        """Publish a feed status object to ``engine:feed_status`` (best-effort).
+
+        Telemetry, not control flow: see :meth:`_write_feed_health` for why a
+        Redis failure here must never propagate.
+        """
         payload = {
             "type": "feed_status",
             "status": status,
@@ -560,7 +652,10 @@ class AlpacaMarketDataConsumer(_SupervisedStreamConsumer):
             "symbols": self._symbols,
             "timestamp": self._now_iso(),
         }
-        await self._redis.publish(CHANNEL_FEED_STATUS, json.dumps(payload))
+        try:
+            await self._redis.publish(CHANNEL_FEED_STATUS, json.dumps(payload))
+        except Exception as exc:  # noqa: BLE001 — the feed must outlive its telemetry
+            log.warning("alpaca.feed.status_publish_failed", status=status, error=repr(exc))
 
     async def _write_feed_health(self, status: str, *, force: bool = False) -> None:
         """``SETEX`` the level-based feed-health key (no-op without a key).
@@ -571,15 +666,44 @@ class AlpacaMarketDataConsumer(_SupervisedStreamConsumer):
         one per ``_FEED_HEALTH_REFRESH_SECONDS`` so a busy feed doesn't turn
         every message into a Redis write; status transitions pass
         ``force=True`` and always land.
+
+        A Redis failure is SWALLOWED, and this is load-bearing. ``start()``
+        awaits :meth:`_mark_alive` — i.e. this write — before entering the
+        supervisor's try/except, so a raise here escapes
+        :meth:`AlpacaMarketDataConsumer.start` entirely: the market-data task
+        dies for good, no reconnect ever runs, and because that task is in the
+        engine's ``critical`` list the composite ``halted()`` then blocks every
+        entry for the life of the process. Observed live during the Phase-2
+        dress rehearsal: one transient ``redis.exceptions.TimeoutError`` on a
+        cold boot ⇒ ``engine.task_died task=market_data``, and the engine ran on
+        permanently halted with a healthy-looking heartbeat. Degrading to "no
+        key" instead is the SAFE direction — absence already reads as stale.
+        The throttle only advances on a write that actually landed, so a failed
+        attempt retries on the next watchdog tick rather than waiting out the
+        refresh window.
         """
         if self._feed_health_key is None:
             return
         now = self._now()
         if not force and now - self._last_health_write < _FEED_HEALTH_REFRESH_SECONDS:
             return
+        # `window_seconds` lets the reader judge FRESHNESS, not just presence:
+        # Redis can reject writes while still serving reads (MISCONF, OOM), and
+        # these writes are swallowed by design — without a stamp the last good
+        # "ok" would be believed until its TTL lapsed.
+        payload = {
+            "status": status,
+            "at": self._now_iso(),
+            "window_seconds": self._staleness_seconds,
+        }
+        try:
+            await self._redis.setex(
+                self._feed_health_key, self._feed_health_ttl, json.dumps(payload)
+            )
+        except Exception as exc:  # noqa: BLE001 — see the docstring: fail toward "stale"
+            log.warning("alpaca.feed.health_write_failed", status=status, error=repr(exc))
+            return
         self._last_health_write = now
-        payload = {"status": status, "at": self._now_iso()}
-        await self._redis.setex(self._feed_health_key, self._feed_health_ttl, json.dumps(payload))
 
     # -- clock (overridable in tests) -----------------------------------------
 

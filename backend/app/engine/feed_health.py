@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 from app.core.logging import get_logger
@@ -68,6 +69,16 @@ class FeedHealth:
                 continue
 
     async def _read_level(self) -> bool:
+        """True = stale. Absent, unparseable, not-ok, or simply TOO OLD.
+
+        The age check is not redundant with the key's TTL. Redis can reject
+        writes while still serving reads — a failing RDB snapshot (``MISCONF``)
+        or ``maxmemory`` pressure does exactly that — and the writer swallows
+        those failures by design so a telemetry hiccup can't kill the feed. In
+        that state the last good ``ok`` would sit there being believed until
+        its TTL lapsed. Trusting the payload's own timestamp against the window
+        the writer stamped into it collapses that window to one poll interval.
+        """
         raw = await self._redis.get(self._key)
         if raw is None:
             return True
@@ -75,4 +86,21 @@ class FeedHealth:
             data = json.loads(raw)
         except (json.JSONDecodeError, TypeError, UnicodeDecodeError):
             return True
-        return bool(data.get("status") != "ok")
+        if data.get("status") != "ok":
+            return True
+        stamped_at = data.get("at")
+        window = data.get("window_seconds")
+        if not isinstance(stamped_at, str) or not isinstance(window, int | float):
+            # No freshness evidence ⇒ stale. This module fails closed
+            # everywhere else, and there is no version skew to accommodate:
+            # writer and reader ship in the same image. A leftover pre-stamp
+            # key from an older engine expires with its TTL and is overwritten
+            # within a second of the new engine's first message, so the cost is
+            # bounded to one boot's worth of blocked entries — in a scenario
+            # that cannot currently arise. "ok" must mean someone proved it.
+            return True
+        try:
+            age = (datetime.now(UTC) - datetime.fromisoformat(stamped_at)).total_seconds()
+        except ValueError:
+            return True
+        return age > float(window)

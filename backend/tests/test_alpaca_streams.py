@@ -601,6 +601,7 @@ async def test_staleness_watchdog_publishes_feed_stale_then_feed_ok() -> None:
         redis,
         ["AAPL"],
         stream_factory=lambda creds, feed: stream,
+        subscribe_trades=True,  # continuous channel: a 30s window is honest here
         staleness_seconds=30,
         watchdog_poll_seconds=0.005,  # fast real-time poll; fake clock drives staleness
     )
@@ -641,6 +642,7 @@ async def test_no_feed_stale_while_data_flows() -> None:
         redis,
         ["AAPL"],
         stream_factory=lambda creds, feed: stream,
+        subscribe_trades=True,  # continuous channel: a 30s window is honest here
         staleness_seconds=30,
         watchdog_poll_seconds=0.005,
     )
@@ -672,6 +674,7 @@ def _health_consumer(redis: FakeRedis, stream: FakeMarketStream) -> _FakeClockCo
         redis,
         ["AAPL"],
         stream_factory=lambda creds, feed: stream,
+        subscribe_trades=True,  # continuous channel: a 30s window is honest here
         staleness_seconds=30,
         watchdog_poll_seconds=0.005,
         portfolio_id="pf-hk",
@@ -682,10 +685,15 @@ def test_feed_health_key_shape() -> None:
     assert feed_health_key("pf-hk") == "engine:feed_health:pf-hk"
 
 
-async def test_feed_health_key_written_on_start_with_ttl() -> None:
-    """Boot writes status=ok under TTL 2× the staleness window."""
+async def test_feed_health_key_written_on_first_data_with_ttl() -> None:
+    """The first real message writes status=ok under TTL 2× the window.
+
+    Boot deliberately writes nothing — health must be earned by data, and key
+    absence already reads as stale.
+    """
     redis = FakeRedis()
     stream = FakeMarketStream()
+    stream.feed = [("bar", fake_bar())]
     consumer = _health_consumer(redis, stream)
 
     task = asyncio.create_task(consumer.start())
@@ -706,6 +714,7 @@ async def test_feed_health_refreshes_are_throttled() -> None:
     """A busy feed refreshes the key at most ~1/sec, not once per message."""
     redis = FakeRedis()
     stream = FakeMarketStream()
+    stream.feed = [("bar", fake_bar())]  # earns the first health write
     consumer = _health_consumer(redis, stream)
 
     task = asyncio.create_task(consumer.start())
@@ -732,7 +741,8 @@ async def test_watchdog_refreshes_health_key_while_quiet_but_healthy() -> None:
     """No data flowing yet not stale: the WATCHDOG keeps the key alive, so
     key absence means watchdog-dead — never mere feed quiet."""
     redis = FakeRedis()
-    stream = FakeMarketStream()  # empty feed: no messages at all
+    stream = FakeMarketStream()
+    stream.feed = [("bar", fake_bar())]  # one message, then silence
     consumer = _health_consumer(redis, stream)
 
     task = asyncio.create_task(consumer.start())
@@ -761,7 +771,7 @@ async def test_never_received_data_goes_stale_and_key_flips() -> None:
 
     assert _has_status(redis, "feed_stale")
     statuses = redis.health_statuses(HEALTH_KEY)
-    assert statuses[0] == "ok"  # boot seed
+    assert "ok" not in statuses, "advertised health without ever receiving data"
     assert statuses[-1] == "stale"  # transition forced through the throttle
 
 
@@ -786,6 +796,106 @@ async def test_feed_health_key_flips_back_to_ok_on_recovery() -> None:
     await _join(task)
 
     assert _has_status(redis, "feed_ok")
+
+
+class FlakyRedis(FakeRedis):
+    """FakeRedis whose ``setex``/``publish`` fail for the first ``n`` calls.
+
+    Models the real failure: a cold-boot ``redis.exceptions.TimeoutError`` on
+    the very first health write.
+    """
+
+    def __init__(self, *, setex_failures: int = 0, publish_failures: int = 0) -> None:
+        super().__init__()
+        self.setex_failures = setex_failures
+        self.publish_failures = publish_failures
+
+    async def setex(self, name: str, time: int, value: str) -> bool:
+        if self.setex_failures > 0:
+            self.setex_failures -= 1
+            msg = "Timeout connecting to server"
+            raise TimeoutError(msg)
+        return await super().setex(name, time, value)
+
+    async def publish(self, channel: str, message: str) -> int:
+        if self.publish_failures > 0:
+            self.publish_failures -= 1
+            msg = "Timeout connecting to server"
+            raise TimeoutError(msg)
+        return await super().publish(channel, message)
+
+
+async def test_health_write_failure_neither_kills_nor_reconnects_the_consumer() -> None:
+    """A Redis hiccup on a health write must not disturb the feed at all.
+
+    Regression, observed live in the Phase-2 dress rehearsal: ``start()`` used
+    to await ``_mark_alive()`` (a health SETEX) BEFORE the supervisor's
+    try/except, so a raise there escaped ``start()`` and killed the
+    market-data task permanently — no reconnect, and because that task is
+    ``critical`` the composite ``halted()`` blocked every entry for the life
+    of the process, behind a heartbeat that still looked alive.
+
+    Boot no longer writes at all, so the write now happens on a real message
+    INSIDE the supervisor — where an escape would trigger a stream teardown
+    and reconnect instead. Swallowing keeps a telemetry hiccup from becoming a
+    reconnect storm.
+    """
+    redis = FlakyRedis(setex_failures=1)
+    stream = FakeMarketStream()
+    consumer = _health_consumer(redis, stream)
+
+    task = asyncio.create_task(consumer.start())
+    await _wait_for(lambda: stream.bar_handler is not None)
+
+    await stream.bar_handler(fake_bar())  # this write raises, and is swallowed
+    assert not task.done(), "a health-write failure killed the market-data task"
+    assert stream.run_count == 1, "a health-write failure forced a stream reconnect"
+
+    # The next write (one throttle window later) recovers the key.
+    consumer.fake_time = 1.0
+    await stream.bar_handler(fake_bar())
+    assert redis.health_statuses(HEALTH_KEY) == ["ok"]
+
+    await consumer.stop()
+    await _join(task)
+
+
+async def test_failed_health_write_does_not_advance_the_throttle() -> None:
+    """A write that never landed must be retried, not throttled out."""
+    redis = FlakyRedis(setex_failures=1)
+    stream = FakeMarketStream()
+    consumer = _health_consumer(redis, stream)
+
+    task = asyncio.create_task(consumer.start())
+    await _wait_for(lambda: stream.bar_handler is not None)
+
+    # Two messages in the SAME fake second: the first write fails, and were the
+    # throttle advanced on failure the retry would be swallowed and the key
+    # would stay absent for a full refresh window.
+    assert consumer.fake_time == 0.0
+    await stream.bar_handler(fake_bar())  # fails
+    await stream.bar_handler(fake_bar())  # retry, same second
+    assert redis.health_statuses(HEALTH_KEY) == ["ok"]
+
+    await consumer.stop()
+    await _join(task)
+
+
+async def test_feed_status_publish_failure_does_not_kill_the_market_data_task() -> None:
+    """The edge-triggered status channel is telemetry — its failure is survivable."""
+    redis = FlakyRedis(publish_failures=99)  # every publish fails, forever
+    stream = FakeMarketStream()
+    consumer = _health_consumer(redis, stream)
+
+    task = asyncio.create_task(consumer.start())
+    await _wait_for(lambda: stream.bar_handler is not None)
+    # Drive the watchdog into the stale transition (which publishes + writes).
+    consumer.fake_time = 31.0
+    await _wait_for(lambda: "stale" in redis.health_statuses(HEALTH_KEY))
+    assert not task.done(), "a failed feed-status publish killed the market-data task"
+
+    await consumer.stop()
+    await _join(task)
 
 
 async def test_no_feed_health_key_without_portfolio_id() -> None:
@@ -865,3 +975,197 @@ async def _join(task: asyncio.Task[None]) -> None:
         task.cancel()
         with pytest.raises((asyncio.CancelledError, TimeoutError)):
             await task
+
+
+# ── Staleness floor (threshold must exceed the slowest subscribed cadence) ──
+
+
+def _floor_consumer(**over: Any) -> AlpacaMarketDataConsumer:
+    kwargs: dict[str, Any] = {
+        "stream_factory": lambda creds, feed: FakeMarketStream(),
+        "portfolio_id": "pf-floor",
+    }
+    kwargs.update(over)
+    return AlpacaMarketDataConsumer(CREDS, FakeRedis(), ["AAPL"], **kwargs)
+
+
+def test_bars_only_staleness_is_floored_above_the_bar_interval() -> None:
+    """The default 30s window is a guaranteed false-positive on 1/min bars.
+
+    Bars arrive once a MINUTE, so a sub-minute threshold doesn't detect
+    outages — it manufactures one every single minute, blocking entries at
+    random (Phase-2 dress-rehearsal finding).
+    """
+    consumer = _floor_consumer(staleness_seconds=30)
+    assert consumer._staleness_seconds == 120.0  # noqa: SLF001
+
+
+def test_continuous_channels_leave_the_requested_window_alone() -> None:
+    """Quotes/trades print far faster than a minute — 30s is honest there."""
+    assert _floor_consumer(staleness_seconds=30, subscribe_trades=True)._staleness_seconds == 30  # noqa: SLF001
+    assert _floor_consumer(staleness_seconds=30, subscribe_quotes=True)._staleness_seconds == 30  # noqa: SLF001
+
+
+def test_a_window_already_above_the_floor_is_untouched() -> None:
+    consumer = _floor_consumer(staleness_seconds=300)
+    assert consumer._staleness_seconds == 300  # noqa: SLF001
+
+
+def test_health_key_ttl_never_lapses_before_the_staleness_window() -> None:
+    """TTL is derived from the EFFECTIVE window, not the raw request.
+
+    A TTL shorter than the threshold would expire the health key while the
+    feed is still considered healthy, and the fail-closed reader (absence ⇒
+    stale) would call that an outage — the same false-stale bug, entered from
+    the opposite end.
+    """
+    for kwargs in ({"staleness_seconds": 30}, {"staleness_seconds": 30, "subscribe_trades": True}):
+        consumer = _floor_consumer(**kwargs)
+        assert consumer._feed_health_ttl >= consumer._staleness_seconds  # noqa: SLF001
+
+
+def test_watchdog_poll_tracks_the_effective_window() -> None:
+    """The poll derives from the FLOORED window, not the raw request.
+
+    Uses 10s deliberately: the poll formula caps at 5s, so at the 30s default
+    both the old and new code land on 5.0 and an assertion there would guard
+    nothing. At 10s the pre-fix code gives 2.0 (10/5) and the floored window
+    gives 5.0 (120/5 capped) — so this test actually fails if the derivation
+    regresses to the raw parameter.
+    """
+    consumer = _floor_consumer(staleness_seconds=10)
+    assert consumer._staleness_seconds == 120.0  # noqa: SLF001
+    assert consumer._watchdog_poll == 5.0  # noqa: SLF001
+
+
+async def test_a_failed_stale_health_write_is_retried_on_the_next_tick() -> None:
+    """The blackout marker must survive a dropped write.
+
+    Health writes are swallowed best-effort so a Redis hiccup can't kill the
+    feed — which means the ok→stale write cannot be edge-triggered: one
+    dropped write would leave the key holding its last "ok" for the rest of
+    the blackout, lying to every reader of that key. (The reader's freshness
+    check is the second line of defense; this is the first.)
+    """
+
+    class StaleWriteFailsOnce(FakeRedis):
+        def __init__(self) -> None:
+            super().__init__()
+            self.stale_attempts = 0
+
+        async def setex(self, name: str, time: int, value: str) -> bool:
+            if json.loads(value)["status"] == "stale":
+                self.stale_attempts += 1
+                if self.stale_attempts == 1:
+                    msg = "Timeout connecting to server"
+                    raise TimeoutError(msg)
+            return await super().setex(name, time, value)
+
+    redis = StaleWriteFailsOnce()
+    stream = FakeMarketStream()
+    consumer = _FakeClockConsumer(
+        CREDS,
+        redis,
+        ["AAPL"],
+        stream_factory=lambda creds, feed: stream,
+        subscribe_trades=True,  # continuous channel: a 30s window is honest here
+        staleness_seconds=30,
+        watchdog_poll_seconds=0.005,
+        portfolio_id="pf-hk",
+    )
+
+    task = asyncio.create_task(consumer.start())
+    await _wait_for(lambda: stream.bar_handler is not None)
+
+    # Cross the threshold; the first "stale" write raises and is swallowed.
+    consumer.fake_time = 40.0
+    await _wait_for(lambda: redis.stale_attempts >= 1)
+
+    # Keep ticking with the clock advancing so the 1s refresh throttle can
+    # never be the reason a retry didn't happen.
+    for moment in (41.0, 42.0, 43.0):
+        consumer.fake_time = moment
+        await _wait_for(lambda: redis.stale_attempts >= 2, timeout=1.0)
+
+    await consumer.stop()
+    await _join(task)
+
+    assert redis.stale_attempts >= 2, "the failed stale write was never retried"
+    statuses = redis.health_statuses(HEALTH_KEY)
+    assert statuses[-1] == "stale", f"key still advertises {statuses[-1]!r} during a blackout"
+
+
+async def test_production_config_bars_only_healthy_feed_never_goes_stale() -> None:
+    """The shipping configuration, exercised behaviourally — not just asserted
+    at the constructor.
+
+    Bars-only with the floored 120s window is what the engine actually runs.
+    A healthy feed delivering one bar per 60s must NEVER publish feed_stale
+    (the bug this whole branch exists to kill), and must still go stale when
+    the feed genuinely dies.
+    """
+    redis = FakeRedis()
+    stream = FakeMarketStream()
+    consumer = _FakeClockConsumer(
+        CREDS,
+        redis,
+        ["AAPL"],
+        stream_factory=lambda creds, feed: stream,
+        portfolio_id="pf-hk",  # bars-only: no subscribe_quotes/trades
+        watchdog_poll_seconds=0.005,
+    )
+    assert consumer._staleness_seconds == 120.0  # noqa: SLF001 — the shipping window
+
+    task = asyncio.create_task(consumer.start())
+    await _wait_for(lambda: stream.bar_handler is not None)
+
+    # Three healthy minutes: a bar every 60s, watchdog polling throughout.
+    for minute in (60.0, 120.0, 180.0):
+        consumer.fake_time = minute
+        await stream.bar_handler(fake_bar())
+        await asyncio.sleep(0.03)
+    assert not _has_status(redis, "feed_stale"), "healthy 1/min feed was flagged stale"
+
+    # Now the feed genuinely dies: past 120s since the last bar → stale.
+    consumer.fake_time = 301.0
+    await _wait_for(lambda: _has_status(redis, "feed_stale"))
+
+    await consumer.stop()
+    await _join(task)
+
+
+async def test_boot_advertises_no_health_until_real_data_arrives() -> None:
+    """A socket that never connects must not read healthy for a whole window.
+
+    Key absence already means stale to the reader, so writing nothing is the
+    fail-closed answer — and `start()` seeding the staleness clock must not be
+    mistaken for evidence the feed works.
+    """
+    redis = FakeRedis()
+    stream = FakeMarketStream()
+    consumer = _FakeClockConsumer(
+        CREDS,
+        redis,
+        ["AAPL"],
+        stream_factory=lambda creds, feed: stream,
+        portfolio_id="pf-hk",
+        watchdog_poll_seconds=0.005,
+    )
+
+    task = asyncio.create_task(consumer.start())
+    await _wait_for(lambda: stream.bar_handler is not None)
+    await asyncio.sleep(0.05)  # several watchdog ticks, still no data
+    assert redis.health_statuses(HEALTH_KEY) == [], "boot advertised unearned health"
+
+    # First real bar → now we have evidence, and the key says so.
+    consumer.fake_time = 1.0
+    await stream.bar_handler(fake_bar())
+    await _wait_for(lambda: redis.health_statuses(HEALTH_KEY) == ["ok"])
+
+    await consumer.stop()
+    await _join(task)
+
+
+def test_continuous_channel_window_still_has_an_absolute_floor() -> None:
+    """A zero window makes every tick stale and wedges entries off forever."""
+    assert _floor_consumer(staleness_seconds=0, subscribe_trades=True)._staleness_seconds == 5.0  # noqa: SLF001
