@@ -34,7 +34,9 @@ async def test_starts_stale_before_any_observation() -> None:
 
 async def test_ok_key_reads_healthy() -> None:
     redis = FakeRedis()
-    redis.value = '{"status": "ok", "stamped_at": "2026-06-26T15:00:00+00:00"}'
+    redis.value = json.dumps(
+        {"status": "ok", "at": datetime.now(UTC).isoformat(), "window_seconds": 120}
+    )
     health = _health(redis)
 
     shutdown = asyncio.Event()
@@ -49,7 +51,9 @@ async def test_ok_key_reads_healthy() -> None:
 
 async def test_stale_status_reads_stale() -> None:
     redis = FakeRedis()
-    redis.value = '{"status": "ok"}'
+    redis.value = json.dumps(
+        {"status": "ok", "at": datetime.now(UTC).isoformat(), "window_seconds": 120}
+    )
     health = _health(redis)
 
     shutdown = asyncio.Event()
@@ -66,7 +70,9 @@ async def test_stale_status_reads_stale() -> None:
 async def test_absent_key_reads_stale() -> None:
     # TTL lapsed / watchdog dead / Redis flushed — all the same answer.
     redis = FakeRedis()
-    redis.value = '{"status": "ok"}'
+    redis.value = json.dumps(
+        {"status": "ok", "at": datetime.now(UTC).isoformat(), "window_seconds": 120}
+    )
     health = _health(redis)
 
     shutdown = asyncio.Event()
@@ -82,7 +88,9 @@ async def test_absent_key_reads_stale() -> None:
 
 async def test_unparseable_value_reads_stale() -> None:
     redis = FakeRedis()
-    redis.value = '{"status": "ok"}'
+    redis.value = json.dumps(
+        {"status": "ok", "at": datetime.now(UTC).isoformat(), "window_seconds": 120}
+    )
     health = _health(redis)
 
     shutdown = asyncio.Event()
@@ -99,7 +107,9 @@ async def test_unparseable_value_reads_stale() -> None:
 async def test_redis_error_reads_stale() -> None:
     # A health check that cannot run is a health check that failed.
     redis = FakeRedis()
-    redis.value = '{"status": "ok"}'
+    redis.value = json.dumps(
+        {"status": "ok", "at": datetime.now(UTC).isoformat(), "window_seconds": 120}
+    )
     health = _health(redis)
 
     shutdown = asyncio.Event()
@@ -139,10 +149,23 @@ async def test_ok_payload_older_than_its_window_reads_stale() -> None:
     assert await _health(redis)._read_level() is True  # noqa: SLF001
 
 
-async def test_payload_without_freshness_stamp_falls_back_to_ttl_trust() -> None:
-    """An older writer's payload must not hard-fail a healthy feed."""
+async def test_payload_without_freshness_stamp_reads_stale() -> None:
+    """No freshness evidence ⇒ stale: this module fails closed everywhere."""
     redis = FakeRedis()
     redis.value = '{"status": "ok"}'
+    assert await _health(redis)._read_level() is True  # noqa: SLF001
+
+
+async def test_quiet_but_healthy_feed_inside_its_window_reads_ok() -> None:
+    """Pins the cross-file coupling to the writer's LEVEL-triggered refresh.
+
+    `streams.py`'s watchdog re-stamps "ok" every poll (5s) even when no
+    messages arrive, so `at` never approaches the 120s window on a healthy
+    feed. If that write is ever made edge-triggered, this test fails — which
+    is the point: the reader's age check is only safe because of it.
+    """
+    redis = FakeRedis()
+    redis.value = _ok_payload(age_seconds=119, window=120.0)
     assert await _health(redis)._read_level() is False  # noqa: SLF001
 
 

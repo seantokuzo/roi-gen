@@ -101,6 +101,9 @@ _BAR_INTERVAL_SECONDS = 60.0
 #: Safety factor over the slowest subscribed cadence — one missed bar must not
 #: read as an outage.
 _STALENESS_FLOOR_FACTOR = 2.0
+#: Absolute floor regardless of subscriptions: a window of 0 makes every tick
+#: "stale" and wedges entries off permanently.
+_MIN_STALENESS_SECONDS = 5.0
 
 
 def _staleness_floor(requested: float, *, quotes: bool, trades: bool) -> float:
@@ -121,7 +124,12 @@ def _staleness_floor(requested: float, *, quotes: bool, trades: bool) -> float:
     remembering to re-tune a constant.
     """
     if quotes or trades:
-        return requested
+        # Continuous channels justify a sub-minute window, but not a zero or
+        # negative one: `(now - last) >= 0` is always true, so the watchdog
+        # would flag stale on its first tick and never clear — blocking every
+        # entry for the life of the process. Fails closed, but it's an
+        # availability footgun on the branch we'd use to tighten detection.
+        return max(requested, _MIN_STALENESS_SECONDS)
     floor = _BAR_INTERVAL_SECONDS * _STALENESS_FLOOR_FACTOR
     if requested >= floor:
         return requested
@@ -475,6 +483,10 @@ class AlpacaMarketDataConsumer(_SupervisedStreamConsumer):
         # Watchdog state.
         self._last_msg_at: float | None = None
         self._feed_stale = False
+        # False until a real message lands: boot must not advertise health it
+        # has not earned (a socket that never connects would otherwise read
+        # healthy for a full window).
+        self._seen_data = False
         self._watchdog_task: asyncio.Task[None] | None = None
 
         # Level-based feed-health key (None → pub/sub transitions only; the
@@ -501,8 +513,16 @@ class AlpacaMarketDataConsumer(_SupervisedStreamConsumer):
     # -- lifecycle (wrap base to run the watchdog alongside) ------------------
 
     async def start(self) -> None:
-        """Start the stream supervisor and the staleness watchdog together."""
-        await self._mark_alive()
+        """Start the stream supervisor and the staleness watchdog together.
+
+        The staleness clock is SEEDED here, but no health is advertised: until
+        a real message lands we have no evidence the feed works, and a socket
+        that never connects at all (bad key, Alpaca down, the 406 one-connection
+        limit) must not read as healthy for a whole window. Key absence already
+        means stale to the reader, which is exactly the right answer here.
+        """
+        self._last_msg_at = self._now()
+        self._reset_backoff()
         self._watchdog_task = asyncio.create_task(self._watchdog_loop())
         try:
             await super().start()
@@ -559,6 +579,7 @@ class AlpacaMarketDataConsumer(_SupervisedStreamConsumer):
         flip bypasses the throttle so the key never lags the transition.
         """
         self._last_msg_at = self._now()
+        self._seen_data = True  # first real evidence the feed works
         self._reset_backoff()
         if self._feed_stale:
             self._feed_stale = False
@@ -609,7 +630,13 @@ class AlpacaMarketDataConsumer(_SupervisedStreamConsumer):
                 # blackout. The reader's freshness check would still catch it,
                 # but the key itself would be lying to everything else.
                 await self._write_feed_health("stale", force=transition)
-            else:
+            elif self._seen_data:
+                # LEVEL-TRIGGERED, and the reader depends on it: `_read_level`
+                # treats an "ok" older than `window_seconds` as stale, which is
+                # only safe because this re-stamps every poll (5s against a
+                # 120s window). Making this edge-triggered would age the key
+                # past the window on a quiet-but-healthy feed and false-trip
+                # the gate — the original bug, re-entered through the reader.
                 await self._write_feed_health("ok")
 
     async def _publish_feed_status(self, status: str) -> None:

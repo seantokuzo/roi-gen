@@ -91,9 +91,14 @@ class FeedHealth:
         stamped_at = data.get("at")
         window = data.get("window_seconds")
         if not isinstance(stamped_at, str) or not isinstance(window, int | float):
-            # A writer too old to stamp freshness — fall back to TTL-only
-            # trust rather than hard-failing a healthy feed.
-            return False
+            # No freshness evidence ⇒ stale. This module fails closed
+            # everywhere else, and there is no version skew to accommodate:
+            # writer and reader ship in the same image. A leftover pre-stamp
+            # key from an older engine expires with its TTL and is overwritten
+            # within a second of the new engine's first message, so the cost is
+            # bounded to one boot's worth of blocked entries — in a scenario
+            # that cannot currently arise. "ok" must mean someone proved it.
+            return True
         try:
             age = (datetime.now(UTC) - datetime.fromisoformat(stamped_at)).total_seconds()
         except ValueError:
