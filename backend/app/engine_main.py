@@ -162,38 +162,39 @@ async def _feed_status_logger(redis: aioredis.Redis, shutdown: asyncio.Event) ->
     layer will use to block new entries (project gotcha), so it belongs in the
     operator-visible log here.
     """
-    pubsub = redis.pubsub()
-    try:
-        await pubsub.subscribe(CHANNEL_FEED_STATUS)
-    except (RedisError, OSError) as exc:
-        log.warning("engine.feed_status.subscribe_failed", error=str(exc))
-        return
-    try:
-        while not shutdown.is_set():
-            try:
+    # Reconnect forever, like every other subscriber: a bare `return` on a
+    # transient subscribe failure would silence feed-status logging for the
+    # LIFE of the process off one Redis blip at boot — the same "one hiccup
+    # kills a task for good" class that took out the market-data consumer
+    # (and this task is deliberately not in `critical`, so nothing would
+    # report its absence).
+    while not shutdown.is_set():
+        pubsub = redis.pubsub()
+        try:
+            await pubsub.subscribe(CHANNEL_FEED_STATUS)
+            while not shutdown.is_set():
                 msg = await pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
-            except (RedisError, OSError) as exc:
-                log.warning("engine.feed_status.read_failed", error=str(exc))
-                await asyncio.sleep(1.0)
-                continue
-            if msg is None:
-                continue
-            data = msg.get("data")
-            if isinstance(data, bytes | bytearray):
-                data = bytes(data).decode()
-            try:
-                event = json.loads(data) if isinstance(data, str) else {}
-            except json.JSONDecodeError:
-                continue
-            log.info(
-                "engine.feed_status",
-                status=event.get("status"),
-                feed=event.get("feed"),
-                symbols=event.get("symbols"),
-            )
-    finally:
-        with _suppress_cleanup_errors():
-            await pubsub.aclose()  # type: ignore[no-untyped-call]  # redis stub gap
+                if msg is None:
+                    continue
+                data = msg.get("data")
+                if isinstance(data, bytes | bytearray):
+                    data = bytes(data).decode()
+                try:
+                    event = json.loads(data) if isinstance(data, str) else {}
+                except json.JSONDecodeError:
+                    continue
+                log.info(
+                    "engine.feed_status",
+                    status=event.get("status"),
+                    feed=event.get("feed"),
+                    symbols=event.get("symbols"),
+                )
+        except (RedisError, OSError) as exc:
+            log.warning("engine.feed_status.error", error=str(exc))
+            await asyncio.sleep(1.0)
+        finally:
+            with _suppress_cleanup_errors():
+                await pubsub.aclose()  # type: ignore[no-untyped-call]  # redis stub gap
 
 
 def _build_market_data_consumer(
@@ -525,6 +526,14 @@ async def main() -> None:
         settings.redis_url,
         socket_connect_timeout=5.0,
         socket_timeout=5.0,
+        # Pub/sub subscribers read with `get_message(timeout=…)`, and a USER
+        # timeout returns None WITHOUT disconnecting — so a half-open socket
+        # (host killed without FIN, partition, laptop sleep) would strand a
+        # subscriber forever: no exception, no reconnect, task still "alive" in
+        # the heartbeat while bars silently stop reaching strategies. redis-py
+        # only PINGs when this is truthy (default 0 = never). With it, a dead
+        # socket raises inside get_message and the existing reconnect loops fire.
+        health_check_interval=15,
     )
 
     trading = _build_trading(settings, redis_client)

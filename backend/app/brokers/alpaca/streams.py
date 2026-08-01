@@ -414,8 +414,8 @@ class AlpacaMarketDataConsumer(_SupervisedStreamConsumer):
     of this consumer alive per account; everything else reads from Redis.
 
     A staleness watchdog publishes a ``feed_stale`` status to
-    ``engine:feed_status`` when no market-data message has arrived for
-    ``staleness_seconds`` (default 30) while the feed is expected live — the
+    ``engine:feed_status`` when no market-data message has arrived for the
+    EFFECTIVE staleness window while the feed is expected live — the
     signal the risk layer uses to block new entries during a feed blackout
     (project gotcha: RTH feed silence ⇒ block entries). It clears with
     ``feed_ok`` as soon as data resumes. Those pub/sub transitions are
@@ -423,6 +423,14 @@ class AlpacaMarketDataConsumer(_SupervisedStreamConsumer):
     consumer ALSO maintains the level-based ``engine:feed_health:{id}`` key
     (see :func:`feed_health_key`) that the engine polls fail-closed —
     key absent ⇒ stale.
+
+    The window is ``staleness_seconds`` raised to a floor the subscribed
+    channels can actually satisfy (see :func:`_staleness_floor`): bars arrive
+    once a MINUTE, so the 30s default alone would flag a healthy bars-only
+    feed stale every minute. Bars-only ⇒ 120s; subscribing quotes or trades
+    (continuous) honours the requested number as-is. Detection latency for a
+    genuine blackout is therefore ~2 min on a bars-only feed — enabling quotes
+    is how you buy it back, and is worth doing before live trading.
     """
 
     def __init__(
@@ -641,7 +649,15 @@ class AlpacaMarketDataConsumer(_SupervisedStreamConsumer):
         now = self._now()
         if not force and now - self._last_health_write < _FEED_HEALTH_REFRESH_SECONDS:
             return
-        payload = {"status": status, "at": self._now_iso()}
+        # `window_seconds` lets the reader judge FRESHNESS, not just presence:
+        # Redis can reject writes while still serving reads (MISCONF, OOM), and
+        # these writes are swallowed by design — without a stamp the last good
+        # "ok" would be believed until its TTL lapsed.
+        payload = {
+            "status": status,
+            "at": self._now_iso(),
+            "window_seconds": self._staleness_seconds,
+        }
         try:
             await self._redis.setex(
                 self._feed_health_key, self._feed_health_ttl, json.dumps(payload)

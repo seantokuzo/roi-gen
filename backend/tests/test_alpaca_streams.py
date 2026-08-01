@@ -1008,6 +1008,14 @@ def test_health_key_ttl_never_lapses_before_the_staleness_window() -> None:
 
 
 def test_watchdog_poll_tracks_the_effective_window() -> None:
-    """Detection latency stays a fraction of the window that's actually used."""
-    consumer = _floor_consumer(staleness_seconds=30)
-    assert consumer._watchdog_poll <= consumer._staleness_seconds / 5  # noqa: SLF001
+    """The poll derives from the FLOORED window, not the raw request.
+
+    Uses 10s deliberately: the poll formula caps at 5s, so at the 30s default
+    both the old and new code land on 5.0 and an assertion there would guard
+    nothing. At 10s the pre-fix code gives 2.0 (10/5) and the floored window
+    gives 5.0 (120/5 capped) — so this test actually fails if the derivation
+    regresses to the raw parameter.
+    """
+    consumer = _floor_consumer(staleness_seconds=10)
+    assert consumer._staleness_seconds == 120.0  # noqa: SLF001
+    assert consumer._watchdog_poll == 5.0  # noqa: SLF001

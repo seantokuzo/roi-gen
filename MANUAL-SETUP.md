@@ -22,7 +22,7 @@ CI; deselected from plain `pytest` by marker.
 
 ### Preconditions (all local)
 
-- **Postgres up** (compose `db`, or the brew fallback — brew Postgres 17 + pgvector also works and is what's currently listening on 5432). The suite creates/migrates its own `*_test` DB.
+- **Postgres up** (compose `db`, or the brew Postgres 17 + pgvector fallback — either works; check with `pg_isready -h localhost -p 5432`). The suite creates/migrates its own `*_test` DB.
 - **Redis up** — this is a real prerequisite, not an assumption. It is NOT started by the test:
 
   ```bash
@@ -39,8 +39,32 @@ CI; deselected from plain `pytest` by marker.
 - **The paper account must be FLAT and ENGINE-ONLY.** Use the `roi-gen-dev` paper account. The flatten controller cancels/closes EVERYTHING in the account, including anything you placed by hand, and the test skips with `paper account not flat: [...]` if any position is open. Check before you start:
 
   ```bash
-  # positions must be [], open orders must be []
+  cd backend && uv run python -c "
+import asyncio
+from app.core.config import get_settings
+from app.brokers.credentials import BrokerCredentials
+from app.brokers.alpaca.factory import build_alpaca_adapter
+
+async def main():
+    s = get_settings()
+    a = build_alpaca_adapter(BrokerCredentials(
+        api_key=s.alpaca_api_key, api_secret=s.alpaca_secret_key, paper=True))
+    try:
+        acct = await a.get_account()
+        pos = await a.list_positions()
+        orders = await a.list_orders(status='open', nested=False)
+        print('account ', acct.account_number, 'equity', acct.equity)
+        print('positions', [(p.symbol, str(p.qty)) for p in pos] or 'FLAT')
+        print('open orders', [(o.symbol, o.status.value) for o in orders] or 'NONE')
+    finally:
+        await a.aclose()
+asyncio.run(main())"
   ```
+
+  Run this from the repo root so `.env` resolves (or export the keys). It also
+  prints the **account number the keys actually resolve to** — confirm that is
+  the account you intend to have flattened, because the `.env` auto-load means
+  you are no longer picking it explicitly at the command line.
 
   (Verified flat on 2026-08-01: account `PA3E3NSRUF91`, equity $5,000, 0 positions, 0 orders ever.)
 - **Market open**, with ≥20 minutes before the close (entries are risk-blocked inside the flatten buffer). Outside RTH the test self-skips with `market closed (next open ...)` — that skip is the correct, healthy outcome, and it proves the env gate passed.
@@ -53,8 +77,9 @@ cd backend
 ROIGEN_LIVE_E2E=1 uv run pytest -m live_paper tests/live/ -q -rs
 ```
 
-`-rs` prints the skip reason, which is what you want when the gates don't pass.
-(`-s` instead of `-rs` if you want the engine log tail streamed live.)
+`-rs` prints the skip reason, which is what you want when the gates don't
+pass. It is orthogonal to `-s` (which disables output capture) — use
+`-rs -s` together if you also want the engine log tail streamed live.
 
 Expected: one test, ~2–6 minutes (dominated by waiting for the first 1-minute
 bar). On failure the engine subprocess's log tail is printed for forensics, and
@@ -65,12 +90,13 @@ lots, command lifecycle, flatten completion). What it can't prove: fill
 realism (paper fills are optimistic NBBO — the Phase-3+ slippage haircut
 exists for that).
 
-### Known blockers found in the closed-market dress rehearsal (2026-08-01)
+### Defects found by the closed-market dress rehearsal (2026-08-01) — all FIXED
 
 The engine was booted for real against the paper account with the market closed.
 Boot reconcile, heartbeat/task-liveness, the trade-updates websocket, the
-kill-switch round trip, the singleton lock and graceful shutdown all passed. Two
-defects surfaced that the offline suite cannot see:
+kill-switch round trip, the singleton lock and graceful shutdown all passed.
+Three defects surfaced that the offline suite cannot see — all now fixed and
+regression-tested, so the run below is expected to work:
 
 1. **FIXED — `market_data` could die permanently on a transient Redis error at
    boot.** `AlpacaMarketDataConsumer.start()` awaited the first feed-health
@@ -81,23 +107,44 @@ defects surfaced that the offline suite cannot see:
    health/status writes are now best-effort (fail toward "stale", the safe
    direction), with regression tests.
 
-2. **OPEN — the staleness gate false-positives on a bars-only feed.** The engine
-   subscribes to **minute bars only**, but `staleness_seconds` is 30s. Bars
-   arrive every 60s, so on a perfectly healthy feed the level flips
-   `ok → stale → ok` every minute and `alpaca.feed.stale` fires every minute.
-   `FeedHealth` polls that level every 5s, so at the instant a bar arrives the
-   gate still reads STALE — and the probe emits its signal on exactly that
-   bar, with `max_entries_per_session = 1`. **Decide this before the next
-   live-paper attempt**; until then expect the entry to be risk-rejected and
-   the run to time out at `probe entry order filled`.
+2. **FIXED — the staleness gate false-positived on a bars-only feed.** The
+   engine subscribes to **minute bars only**, but `staleness_seconds` was 30s.
+   Bars arrive every 60s, so on a perfectly healthy feed the level flipped
+   `ok → stale → ok` every minute. `FeedHealth` polls that level every 5s, so
+   at the instant a bar arrived the gate still read STALE — and the probe
+   emits its signal on exactly that bar, with `max_entries_per_session = 1`, so
+   the run would have timed out at `probe entry order filled`.
+   The threshold is now floored at **2× the slowest SUBSCRIBED cadence**:
+   bars-only ⇒ 120s; subscribing quotes or trades (continuous channels)
+   honours the requested number unchanged. The invariant lives in code, so it
+   can't be re-broken by changing the subscription set. The health key's TTL
+   and the watchdog poll derive from the *effective* window, and the reader
+   now checks the payload's own age — a Redis that rejects writes while still
+   serving reads (MISCONF/OOM) can no longer leave a stale `ok` believed.
+   *Trade-off to know:* genuine-blackout detection for entries is now ~2 min
+   on a bars-only feed. Enabling quotes buys it back to ~35s and is worth
+   doing before live trading (tracked for Phase 9).
+
+3. **FIXED — pub/sub subscribers churned a reconnect every 5 seconds.** The
+   command channel and the market bridge used the blocking `pubsub.listen()`
+   against a client with `socket_timeout=5.0`, so every 5s lull raised and
+   forced a resubscribe (28 cycles in a 4-minute run), adding command latency
+   and leaving a window where a bar could be missed. Both now use
+   `get_message(timeout=1.0)` like the trade-updates subscriber. Because a
+   *user* timeout returns `None` without disconnecting, the engine's Redis
+   client also sets `health_check_interval=15` — otherwise a half-open socket
+   would strand a subscriber silently, forever, behind a green heartbeat.
 
 ### Note on DEBUG logs
 
 `DEBUG=true` (which the test forces on the child) turns on the websockets frame
 logger, which prints the trade-stream `authenticate` frame — including a partial
 `key_id`. The engine log file and the on-failure tail therefore contain a
-fragment of the paper API key. Fine locally; don't paste a raw tail into an
-issue or a PR.
+fragment of the paper API key. Note the log is written to a temp file that is
+deliberately NOT deleted (the path is echoed at the end of the run, so a failure
+is diagnosable) — so that fragment persists on disk after every run. Fine
+locally; don't paste a raw tail into an issue or a PR, and clear out old
+`roigen-e2e-engine-*.log` files periodically.
 
 ## Before Phase 9 (going live with real money)
 

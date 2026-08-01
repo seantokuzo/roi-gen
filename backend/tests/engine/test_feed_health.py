@@ -9,6 +9,8 @@ no new entries.
 from __future__ import annotations
 
 import asyncio
+import json
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, cast
 
 from app.engine.feed_health import FeedHealth
@@ -109,3 +111,42 @@ async def test_redis_error_reads_stale() -> None:
     finally:
         shutdown.set()
         await asyncio.wait_for(task, timeout=2.0)
+
+
+# ── Freshness: a stale "ok" must not be believed until its TTL lapses ──
+
+
+def _ok_payload(*, age_seconds: float, window: float = 120.0) -> str:
+    stamped = datetime.now(UTC) - timedelta(seconds=age_seconds)
+    return json.dumps({"status": "ok", "at": stamped.isoformat(), "window_seconds": window})
+
+
+async def test_fresh_ok_payload_reads_healthy() -> None:
+    redis = FakeRedis()
+    redis.value = _ok_payload(age_seconds=5)
+    assert await _health(redis)._read_level() is False  # noqa: SLF001
+
+
+async def test_ok_payload_older_than_its_window_reads_stale() -> None:
+    """Redis can reject writes while still serving reads (MISCONF / OOM).
+
+    The writer swallows those failures by design, so without an age check the
+    last good "ok" would be trusted for the whole 240s TTL while the feed was
+    already dark.
+    """
+    redis = FakeRedis()
+    redis.value = _ok_payload(age_seconds=200, window=120.0)
+    assert await _health(redis)._read_level() is True  # noqa: SLF001
+
+
+async def test_payload_without_freshness_stamp_falls_back_to_ttl_trust() -> None:
+    """An older writer's payload must not hard-fail a healthy feed."""
+    redis = FakeRedis()
+    redis.value = '{"status": "ok"}'
+    assert await _health(redis)._read_level() is False  # noqa: SLF001
+
+
+async def test_unparseable_timestamp_reads_stale() -> None:
+    redis = FakeRedis()
+    redis.value = json.dumps({"status": "ok", "at": "not-a-time", "window_seconds": 120})
+    assert await _health(redis)._read_level() is True  # noqa: SLF001
